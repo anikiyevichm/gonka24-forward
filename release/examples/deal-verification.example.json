@@ -1,0 +1,7 @@
+{
+  "deal_address": "<EXISTING_DEAL_ADDRESS>",
+  "host": "<EXPECTED_HOST_ADDRESS>",
+  "target_epoch": 123,
+  "price_micro_usdt_per_gnk": "1000000",
+  "buyer_budget_micro_usdt": "100000000"
+}

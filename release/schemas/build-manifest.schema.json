@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gonka.ai/marketplace/schemas/build-manifest-1.0.0.json",
+  "title": "Gonka Marketplace build manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "generated_at_utc", "marketplace_commit_sha", "gonka", "toolchain", "inputs", "contracts", "schemas", "checks"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "kind": {"const": "gonka-marketplace-build-manifest"},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "marketplace_commit_sha": {"$ref": "#/$defs/gitSha"},
+    "gonka": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pinned_source_sha", "runtime"],
+      "properties": {
+        "pinned_source_sha": {"const": "379bebced638aeb5e6077bfd51c986f898443832"},
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_sha", "binary_version", "binary_sha256", "evidence"],
+          "properties": {
+            "source_sha": {"anyOf": [{"$ref": "#/$defs/gitSha"}, {"type": "null"}]},
+            "binary_version": {"type": ["string", "null"]},
+            "binary_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+            "evidence": {"type": ["string", "null"]}
+          }
+        }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rust", "optimizer", "cosmwasm_check"],
+      "properties": {
+        "rust": {"const": "1.81.0"},
+        "cosmwasm_check": {"const": "2.2.2"},
+        "optimizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["image", "digest", "platform"],
+          "properties": {
+            "image": {"const": "cosmwasm/optimizer:0.16.1"},
+            "digest": {"const": "sha256:b9c92b2900b7ebaab3499203615c1b8589592bc557355ed3432e48851ffde69e"},
+            "platform": {"const": "linux/amd64"}
+          }
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cargo_lock_sha256", "proto_generator_lock_sha256"],
+      "properties": {
+        "cargo_lock_sha256": {"$ref": "#/$defs/sha256"},
+        "proto_generator_lock_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "contracts": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/artifact"}},
+    "schemas": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/artifact"}},
+    "checks": {
+      "type": "object",
+      "required": ["source_tree_clean", "committed_lockfiles", "optimizer_build_1", "optimizer_build_2", "reproducible_wasm", "cosmwasm_check"],
+      "additionalProperties": {"type": "object"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "name": {"type": "string"},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

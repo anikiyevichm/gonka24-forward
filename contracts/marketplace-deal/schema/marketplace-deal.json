@@ -1,0 +1,821 @@
+{
+  "contract_name": "marketplace-deal",
+  "contract_version": "0.1.0",
+  "idl_version": "1.0.0",
+  "instantiate": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "InstantiateMsg",
+    "description": "Immutable terms for one isolated Host/epoch deal.",
+    "type": "object",
+    "required": [
+      "buyer_budget_micro_usdt",
+      "factory",
+      "fee_bps",
+      "fee_recipient",
+      "host",
+      "pinned_gonka_sha",
+      "price_micro_usdt_per_gnk",
+      "settlement_cw20",
+      "target_epoch"
+    ],
+    "properties": {
+      "buyer_budget_micro_usdt": {
+        "$ref": "#/definitions/Uint128"
+      },
+      "factory": {
+        "type": "string"
+      },
+      "fee_bps": {
+        "type": "integer",
+        "format": "uint16",
+        "minimum": 0.0
+      },
+      "fee_recipient": {
+        "type": "string"
+      },
+      "host": {
+        "type": "string"
+      },
+      "pinned_gonka_sha": {
+        "type": "string"
+      },
+      "price_micro_usdt_per_gnk": {
+        "$ref": "#/definitions/Uint128"
+      },
+      "settlement_cw20": {
+        "type": "string"
+      },
+      "target_epoch": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0.0
+      }
+    },
+    "additionalProperties": false,
+    "definitions": {
+      "Uint128": {
+        "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+        "type": "string"
+      }
+    }
+  },
+  "execute": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "ExecuteMsg",
+    "oneOf": [
+      {
+        "type": "object",
+        "required": [
+          "receive"
+        ],
+        "properties": {
+          "receive": {
+            "$ref": "#/definitions/Cw20ReceiveMsg"
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "lock"
+        ],
+        "properties": {
+          "lock": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "settle_claim"
+        ],
+        "properties": {
+          "settle_claim": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "description": "Permissionless; transfers only to the immutable recipient for this role.",
+        "type": "object",
+        "required": [
+          "withdraw_usdt"
+        ],
+        "properties": {
+          "withdraw_usdt": {
+            "type": "object",
+            "required": [
+              "role"
+            ],
+            "properties": {
+              "role": {
+                "$ref": "#/definitions/UsdtRole"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "release_unlocked_gnk"
+        ],
+        "properties": {
+          "release_unlocked_gnk": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "refund"
+        ],
+        "properties": {
+          "refund": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "cancel"
+        ],
+        "properties": {
+          "cancel": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "forward_excess_gnk"
+        ],
+        "properties": {
+          "forward_excess_gnk": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    ],
+    "definitions": {
+      "Binary": {
+        "description": "Binary is a wrapper around Vec<u8> to add base64 de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is only needed as serde-json-{core,wasm} has a horrible encoding for Vec<u8>. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
+        "type": "string"
+      },
+      "Cw20ReceiveMsg": {
+        "description": "Cw20ReceiveMsg should be de/serialized under `Receive()` variant in a ExecuteMsg",
+        "type": "object",
+        "required": [
+          "amount",
+          "msg",
+          "sender"
+        ],
+        "properties": {
+          "amount": {
+            "$ref": "#/definitions/Uint128"
+          },
+          "msg": {
+            "$ref": "#/definitions/Binary"
+          },
+          "sender": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Uint128": {
+        "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+        "type": "string"
+      },
+      "UsdtRole": {
+        "description": "Accounting stays separate even when recipient addresses coincide.",
+        "type": "string",
+        "enum": [
+          "host",
+          "fee",
+          "buyer"
+        ]
+      }
+    }
+  },
+  "query": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "QueryMsg",
+    "oneOf": [
+      {
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "properties": {
+          "config": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "funding"
+        ],
+        "properties": {
+          "funding": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "entitlements"
+        ],
+        "properties": {
+          "entitlements": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "release_status"
+        ],
+        "properties": {
+          "release_status": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "native_status"
+        ],
+        "properties": {
+          "native_status": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "required": [
+          "usdt_payments"
+        ],
+        "properties": {
+          "usdt_payments": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    ]
+  },
+  "migrate": null,
+  "sudo": null,
+  "responses": {
+    "config": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ConfigResponse",
+      "type": "object",
+      "required": [
+        "buyer_budget_micro_usdt",
+        "deal_address",
+        "factory",
+        "fee_bps",
+        "fee_recipient",
+        "funded_capacity_ngonka",
+        "host",
+        "pinned_gonka_sha",
+        "price_micro_usdt_per_gnk",
+        "settlement_cw20",
+        "target_epoch"
+      ],
+      "properties": {
+        "buyer_budget_micro_usdt": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "deal_address": {
+          "type": "string"
+        },
+        "factory": {
+          "type": "string"
+        },
+        "fee_bps": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "fee_recipient": {
+          "type": "string"
+        },
+        "funded_capacity_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "host": {
+          "type": "string"
+        },
+        "pinned_gonka_sha": {
+          "type": "string"
+        },
+        "price_micro_usdt_per_gnk": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "settlement_cw20": {
+          "type": "string"
+        },
+        "target_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "entitlements": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "EntitlementsResponse",
+      "type": "object",
+      "required": [
+        "buyer_entitlement_ngonka",
+        "gnk_release_policy",
+        "host_entitlement_ngonka",
+        "reward_ngonka",
+        "total_claim_ngonka",
+        "work_ngonka"
+      ],
+      "properties": {
+        "buyer_entitlement_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "gnk_release_policy": {
+          "$ref": "#/definitions/GnkReleasePolicy"
+        },
+        "host_entitlement_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "reward_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "total_claim_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "work_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "GnkReleasePolicy": {
+          "description": "Frozen lifetime GNK distribution policy.\n\nPositive claims use the exact `buyer_share_numerator / share_denominator` fraction. Proven zero/no-claim outcomes use the explicit Host-only policy; `Unset` means no outcome has established a right to distribute GNK yet.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "unset",
+                "host_only"
+              ]
+            },
+            {
+              "type": "object",
+              "required": [
+                "proportional"
+              ],
+              "properties": {
+                "proportional": {
+                  "type": "object",
+                  "required": [
+                    "buyer_share_numerator",
+                    "share_denominator"
+                  ],
+                  "properties": {
+                    "buyer_share_numerator": {
+                      "$ref": "#/definitions/Uint128"
+                    },
+                    "share_denominator": {
+                      "$ref": "#/definitions/Uint128"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "funding": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "FundingResponse",
+      "type": "object",
+      "required": [
+        "buyer_budget_micro_usdt",
+        "funded",
+        "funded_capacity_ngonka"
+      ],
+      "properties": {
+        "buyer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "buyer_budget_micro_usdt": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "funded": {
+          "type": "boolean"
+        },
+        "funded_capacity_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "native_status": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "NativeStatusResponse",
+      "type": "object",
+      "required": [
+        "liquid_balance_ngonka",
+        "remaining_vesting_ngonka"
+      ],
+      "properties": {
+        "liquid_balance_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "remaining_vesting_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        }
+      }
+    },
+    "release_status": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ReleaseStatusResponse",
+      "type": "object",
+      "required": [
+        "buyer_original_remaining_ngonka",
+        "buyer_released_ngonka",
+        "gnk_release_policy",
+        "host_original_remaining_ngonka",
+        "host_released_ngonka",
+        "released_total_ngonka"
+      ],
+      "properties": {
+        "buyer_original_remaining_ngonka": {
+          "description": "Unpaid part of the original settlement obligation, clamped at zero. These fields are diagnostics, not limits on future lifetime payouts.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint128"
+            }
+          ]
+        },
+        "buyer_released_ngonka": {
+          "$ref": "#/definitions/Uint256"
+        },
+        "gnk_release_policy": {
+          "$ref": "#/definitions/GnkReleasePolicy"
+        },
+        "host_original_remaining_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "host_released_ngonka": {
+          "$ref": "#/definitions/Uint256"
+        },
+        "released_total_ngonka": {
+          "description": "Lifetime paid total; it is intentionally not capped by the claim.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Uint256"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "GnkReleasePolicy": {
+          "description": "Frozen lifetime GNK distribution policy.\n\nPositive claims use the exact `buyer_share_numerator / share_denominator` fraction. Proven zero/no-claim outcomes use the explicit Host-only policy; `Unset` means no outcome has established a right to distribute GNK yet.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "unset",
+                "host_only"
+              ]
+            },
+            {
+              "type": "object",
+              "required": [
+                "proportional"
+              ],
+              "properties": {
+                "proportional": {
+                  "type": "object",
+                  "required": [
+                    "buyer_share_numerator",
+                    "share_denominator"
+                  ],
+                  "properties": {
+                    "buyer_share_numerator": {
+                      "$ref": "#/definitions/Uint128"
+                    },
+                    "share_denominator": {
+                      "$ref": "#/definitions/Uint128"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        },
+        "Uint256": {
+          "description": "An implementation of u256 that is using strings for JSON encoding/decoding, such that the full u256 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances out of primitive uint types or `new` to provide big endian bytes:\n\n``` # use cosmwasm_std::Uint256; let a = Uint256::from(258u128); let b = Uint256::new([ 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 1u8, 2u8, ]); assert_eq!(a, b); ```",
+          "type": "string"
+        }
+      }
+    },
+    "state": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "StateResponse",
+      "type": "object",
+      "required": [
+        "buyer_entitlement_ngonka",
+        "buyer_refund_usdt",
+        "buyer_released_ngonka",
+        "fee_usdt",
+        "gnk_release_policy",
+        "gross_usdt",
+        "host_entitlement_ngonka",
+        "host_net_usdt",
+        "host_released_ngonka",
+        "recipient_locked",
+        "released_total_ngonka",
+        "reward_ngonka",
+        "status",
+        "total_claim_ngonka",
+        "work_ngonka"
+      ],
+      "properties": {
+        "buyer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "buyer_entitlement_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "buyer_refund_usdt": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "buyer_released_ngonka": {
+          "$ref": "#/definitions/Uint256"
+        },
+        "fee_usdt": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "gnk_release_policy": {
+          "$ref": "#/definitions/GnkReleasePolicy"
+        },
+        "gross_usdt": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "host_entitlement_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "host_net_usdt": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "host_released_ngonka": {
+          "$ref": "#/definitions/Uint256"
+        },
+        "recipient_locked": {
+          "type": "boolean"
+        },
+        "refund_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RefundReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "released_total_ngonka": {
+          "$ref": "#/definitions/Uint256"
+        },
+        "reward_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "status": {
+          "$ref": "#/definitions/DealStatus"
+        },
+        "total_claim_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        },
+        "work_ngonka": {
+          "$ref": "#/definitions/Uint128"
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "DealStatus": {
+          "type": "string",
+          "enum": [
+            "open",
+            "funded",
+            "locked",
+            "releasing",
+            "completed",
+            "refunded",
+            "cancelled",
+            "expired"
+          ]
+        },
+        "GnkReleasePolicy": {
+          "description": "Frozen lifetime GNK distribution policy.\n\nPositive claims use the exact `buyer_share_numerator / share_denominator` fraction. Proven zero/no-claim outcomes use the explicit Host-only policy; `Unset` means no outcome has established a right to distribute GNK yet.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "unset",
+                "host_only"
+              ]
+            },
+            {
+              "type": "object",
+              "required": [
+                "proportional"
+              ],
+              "properties": {
+                "proportional": {
+                  "type": "object",
+                  "required": [
+                    "buyer_share_numerator",
+                    "share_denominator"
+                  ],
+                  "properties": {
+                    "buyer_share_numerator": {
+                      "$ref": "#/definitions/Uint128"
+                    },
+                    "share_denominator": {
+                      "$ref": "#/definitions/Uint128"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "RefundReason": {
+          "description": "Authoritative reason for a completed permissionless `Refund {}` transition.",
+          "type": "string",
+          "enum": [
+            "routing_missing",
+            "routing_mismatch",
+            "claim_expiry",
+            "network_unconfirmed"
+          ]
+        },
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        },
+        "Uint256": {
+          "description": "An implementation of u256 that is using strings for JSON encoding/decoding, such that the full u256 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances out of primitive uint types or `new` to provide big endian bytes:\n\n``` # use cosmwasm_std::Uint256; let a = Uint256::from(258u128); let b = Uint256::new([ 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 1u8, 2u8, ]); assert_eq!(a, b); ```",
+          "type": "string"
+        }
+      }
+    },
+    "usdt_payments": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "UsdtPaymentsResponse",
+      "type": "object",
+      "required": [
+        "buyer",
+        "fee",
+        "host"
+      ],
+      "properties": {
+        "buyer": {
+          "$ref": "#/definitions/UsdtPaymentResponse"
+        },
+        "fee": {
+          "$ref": "#/definitions/UsdtPaymentResponse"
+        },
+        "host": {
+          "$ref": "#/definitions/UsdtPaymentResponse"
+        }
+      },
+      "additionalProperties": false,
+      "definitions": {
+        "Uint128": {
+          "description": "A thin wrapper around u128 that is using strings for JSON encoding/decoding, such that the full u128 range can be used for clients that convert JSON numbers to floats, like JavaScript and jq.\n\n# Examples\n\nUse `from` to create instances of this and `u128` to get the value out:\n\n``` # use cosmwasm_std::Uint128; let a = Uint128::from(123u128); assert_eq!(a.u128(), 123);\n\nlet b = Uint128::from(42u64); assert_eq!(b.u128(), 42);\n\nlet c = Uint128::from(70u32); assert_eq!(c.u128(), 70); ```",
+          "type": "string"
+        },
+        "UsdtPaymentResponse": {
+          "type": "object",
+          "required": [
+            "accrued_micro_usdt",
+            "paid_micro_usdt",
+            "pending_micro_usdt"
+          ],
+          "properties": {
+            "accrued_micro_usdt": {
+              "$ref": "#/definitions/Uint128"
+            },
+            "paid_micro_usdt": {
+              "$ref": "#/definitions/Uint128"
+            },
+            "pending_micro_usdt": {
+              "$ref": "#/definitions/Uint128"
+            },
+            "recipient": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  }
+}

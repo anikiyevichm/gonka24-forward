@@ -1,0 +1,17 @@
+[package]
+name = "gonka-proto"
+description = "Pinned generated protobuf bindings required by Gonka Forward Marketplace"
+version.workspace = true
+license-file = "../../LICENSE"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# Upstream comments contain protobuf examples rather than Rust snippets.
+doctest = false
+
+[dependencies]
+prost.workspace = true
+prost-derive.workspace = true

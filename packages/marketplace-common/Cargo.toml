@@ -1,0 +1,21 @@
+[package]
+name = "marketplace-common"
+description = "Shared stateless validation and Gonka query helpers for marketplace contracts"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+cosmwasm-std.workspace = true
+gonka-proto.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

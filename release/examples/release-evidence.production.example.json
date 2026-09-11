@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "gonka-marketplace-release-evidence",
+  "runtime": {
+    "source_sha": "<EXACT_RUNTIME_SOURCE_GIT_SHA>",
+    "binary_version": "<VERIFIED_INFERENCED_VERSION>",
+    "binary_sha256": "<SHA256_OF_VERIFIED_RUNTIME_BINARY>"
+  },
+  "target": {
+    "network_class": "production",
+    "chain_id": "<PRODUCTION_CHAIN_ID>",
+    "rpc_endpoint": "https://<PRODUCTION_RPC_ENDPOINT>",
+    "network_fingerprint_sha256": "<TRUSTED_NETWORK_FINGERPRINT_SHA256>",
+    "pinned_interface_source_sha": "<PINNED_INTERFACE_SOURCE_SHA>",
+    "build_manifest_sha256": "<CURRENT_BUILD_MANIFEST_SHA256>",
+    "runtime_source_sha": "<SAME_RUNTIME_SOURCE_GIT_SHA>",
+    "runtime_binary_version": "<SAME_VERIFIED_INFERENCED_VERSION>",
+    "runtime_binary_sha256": "<SAME_RUNTIME_BINARY_SHA256>",
+    "deal_wasm_sha256": "<SHA256_OF_DEPLOYABLE_DEAL_WASM>",
+    "factory_wasm_sha256": "<SHA256_OF_DEPLOYABLE_FACTORY_WASM>",
+    "settlement_cw20": "<PRODUCTION_CW20_ADDRESS>",
+    "settlement_cw20_decimals": 6,
+    "fee_recipient": "<PRODUCTION_FEE_RECIPIENT>",
+    "fee_bps": 150,
+    "factory_label": "<PRODUCTION_FACTORY_LABEL>",
+    "tx_from": "<PRODUCTION_SIGNER_REFERENCE>",
+    "tx_gas": "auto",
+    "tx_gas_adjustment": "1.3"
+  },
+  "check_reports": {
+    "B1_allowlisted_grpc": {"path": "evidence/b1.json", "sha256": "<SHA256_OF_B1_REPORT>"},
+    "B3_gas_pruning_bounds": {"path": "evidence/b3.json", "sha256": "<SHA256_OF_B3_REPORT>"},
+    "B4_runtime_and_claimed_safety": {"path": "evidence/b4.json", "sha256": "<SHA256_OF_B4_REPORT>"},
+    "B5_golden_e2e": {"path": "evidence/b5.json", "sha256": "<SHA256_OF_B5_REPORT>"},
+    "B6_production_parameters_and_operations": {"path": "evidence/b6.json", "sha256": "<SHA256_OF_B6_REPORT>"}
+  }
+}

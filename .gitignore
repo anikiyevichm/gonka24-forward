@@ -1,0 +1,29 @@
+/target/
+/tools/proto-gen/target/
+__pycache__/
+*.pyc
+
+# Release Wasm files are reproducible build outputs, not source files.
+/artifacts/*
+!/artifacts/.gitignore
+
+.env
+*.rs.bk
+.DS_Store
+
+# IDE and editors
+.idea/
+.vscode/*
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# Python and test caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+#ai
+*.local.md
+

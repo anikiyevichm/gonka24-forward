@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gonka.ai/marketplace/schemas/deployment-receipt-1.0.0.json",
+  "title": "Gonka Marketplace deployment receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "status", "created_at_utc", "chain_id", "build_manifest_sha256", "deployment_config_sha256", "transactions", "code_ids", "contracts", "verification"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "kind": {"const": "gonka-marketplace-deployment-receipt"},
+    "status": {"enum": ["in_progress", "ambiguous", "failed", "complete"]},
+    "created_at_utc": {"type": "string", "format": "date-time"},
+    "chain_id": {"type": "string", "minLength": 1},
+    "build_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "deployment_config_sha256": {"$ref": "#/$defs/sha256"},
+    "transactions": {"type": "array", "items": {"type": "object"}},
+    "code_ids": {"type": "object"},
+    "contracts": {"type": "object"},
+    "verification": {"type": ["object", "null"]},
+    "error": {"type": "string"}
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

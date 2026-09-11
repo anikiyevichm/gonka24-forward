@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Reproduce pinned Gonka protobuf bindings
+        run: |
+          ./scripts/generate-proto.sh
+          changes=$(git status --porcelain=v1 --untracked-files=all -- packages/gonka-proto/src/generated)
+          if [ -n "$changes" ]; then
+            echo "$changes"
+            echo "Generated protobuf snapshot is not committed" >&2
+            exit 1
+          fi
+
+      - name: Reproduce contract JSON schemas
+        run: |
+          ./scripts/generate-schema.sh
+          changes=$(git status --porcelain=v1 --untracked-files=all -- contracts/marketplace-factory/schema contracts/marketplace-deal/schema)
+          if [ -n "$changes" ]; then
+            echo "$changes"
+            echo "Generated schema snapshot is not committed" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path tools/proto-gen/Cargo.toml -- --check
+
+      - name: Run Clippy
+        run: |
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo clippy --manifest-path tools/proto-gen/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test --manifest-path tools/proto-gen/Cargo.toml --locked
+
+      - name: Install pinned Wasm validator
+        run: |
+          cargo install cosmwasm-check --version 2.2.2 --locked
+
+      - name: Test A9 release and deployment tooling
+        run: python -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      - name: Build reproducible release Wasm and validate manifest
+        run: |
+          python scripts/a9_release.py build --output artifacts/ci-release
+          python scripts/a9_release.py verify-artifacts --manifest artifacts/ci-release/build-manifest.json
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install security-tool toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Install pinned security tools
+        run: |
+          cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
+          cargo +1.88.0 install cargo-deny --version 0.20.2 --locked
+
+      - name: Check RustSec advisories
+        run: |
+          cargo audit
+          cargo audit --file tools/proto-gen/Cargo.lock
+
+      - name: Check licenses, bans and sources
+        run: |
+          cargo deny check
+          cargo deny --manifest-path tools/proto-gen/Cargo.toml --config deny.toml --locked check

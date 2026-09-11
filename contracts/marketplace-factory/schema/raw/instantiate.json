@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InstantiateMsg",
+  "description": "Immutable configuration supplied when the Factory is deployed.",
+  "type": "object",
+  "required": [
+    "deal_code_id",
+    "fee_bps",
+    "fee_recipient",
+    "settlement_cw20"
+  ],
+  "properties": {
+    "deal_code_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "fee_bps": {
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0.0
+    },
+    "fee_recipient": {
+      "type": "string"
+    },
+    "settlement_cw20": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

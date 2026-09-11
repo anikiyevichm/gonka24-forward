@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "gonka-marketplace-deployment-config",
+  "network_class": "local",
+  "chain_id": "<SET_LOCAL_CHAIN_ID>",
+  "rpc_endpoint": "http://127.0.0.1:26657",
+  "expected_gonka_source_sha": "379bebced638aeb5e6077bfd51c986f898443832",
+  "build_manifest_sha256": "<SHA256_OF_BUILD_MANIFEST>",
+  "settlement_cw20": "<SET_LOCAL_CW20_ADDRESS>",
+  "settlement_cw20_decimals": 6,
+  "fee_recipient": "<SET_LOCAL_FEE_RECIPIENT>",
+  "fee_bps": 150,
+  "factory_label": "gonka-forward-marketplace-local",
+  "tx": {
+    "from": "<SET_LOCAL_KEY_NAME_OR_ADDRESS>",
+    "gas": "auto",
+    "gas_adjustment": "1.3"
+  },
+  "runtime_evidence": null
+}

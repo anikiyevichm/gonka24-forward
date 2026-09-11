@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gonka.ai/marketplace/schemas/deal-verification-request-1.0.0.json",
+  "title": "Existing Marketplace Deal verification request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["deal_address", "host", "target_epoch", "price_micro_usdt_per_gnk", "buyer_budget_micro_usdt"],
+  "properties": {
+    "deal_address": {"type": "string", "minLength": 1},
+    "host": {"type": "string", "minLength": 1},
+    "target_epoch": {"type": "integer", "minimum": 1},
+    "price_micro_usdt_per_gnk": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "buyer_budget_micro_usdt": {"type": "string", "pattern": "^[1-9][0-9]*$"}
+  }
+}

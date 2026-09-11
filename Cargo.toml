@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts/marketplace-deal",
+    "contracts/marketplace-factory",
+    "packages/gonka-proto",
+    "packages/marketplace-api",
+    "packages/marketplace-common",
+    "tests/contracts/a8-caller",
+    "tests/contracts/a8-query-boundary",
+    "tests/contracts/a8-cw20",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "BUSL-1.1"
+repository = "https://github.com/anikiyevichm/gonka24-forward"
+publish = false
+
+[workspace.dependencies]
+cosmwasm-schema = "=2.2.2"
+cosmwasm-std = { version = "=2.2.2", features = ["cosmwasm_2_0"] }
+cw-storage-plus = "=2.0.0"
+cw2 = "=2.0.0"
+cw20 = "=2.0.0"
+cw-utils = "=2.0.0"
+schemars = "=0.8.22"
+serde = { version = "=1.0.219", default-features = false, features = ["derive"] }
+thiserror = "=1.0.69"
+prost = "=0.12.6"
+prost-derive = "=0.12.6"
+
+cw-multi-test = { version = "=2.5.0", features = ["cosmwasm_2_2"] }
+cw20-base = { version = "=2.0.0", features = ["library"] }
+proptest = "=1.5.0"
+serde_json = "=1.0.140"
+
+gonka-proto = { path = "packages/gonka-proto" }
+marketplace-api = { path = "packages/marketplace-api" }
+marketplace-common = { path = "packages/marketplace-common" }
+marketplace-deal = { path = "contracts/marketplace-deal" }
+marketplace-factory = { path = "contracts/marketplace-factory" }
+
+[profile.release]
+codegen-units = 1
+incremental = false
+lto = true
+opt-level = 3
+overflow-checks = true
+panic = "abort"
+rpath = false

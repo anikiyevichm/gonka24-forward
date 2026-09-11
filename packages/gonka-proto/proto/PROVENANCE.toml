@@ -1,0 +1,27 @@
+source_repository = "https://github.com/gonka-ai/gonka"
+source_commit = "379bebced638aeb5e6077bfd51c986f898443832"
+source_root = "inference-chain/proto"
+upstream_buf_lock_sha256 = "0ad027953ae24b24c1b7147a35e5f6a5d6844a3439bf036bb28a41760b6d87cb"
+snapshot_file_count = 43
+snapshot_line_endings = "preserve exact upstream bytes per file"
+
+entrypoints = [
+  "inference/inference/query.proto",
+  "inference/inference/claim_recipient.proto",
+  "inference/inference/epoch_performance_summary.proto",
+  "inference/streamvesting/query.proto",
+]
+
+[bootstrap]
+# Buf is used only to export the exact transitive source closure once. Normal
+# regeneration consumes the committed snapshot and does not require Buf/network.
+buf_version = "1.72.0"
+buf_windows_x86_64_sha256 = "6e8f6d043e520bc81cae7b85d4cd6d93e57716a8a9842d5d18200191ee259cb5"
+
+[generator]
+rust = "1.81.0"
+prost_build = "0.12.6"
+protoc_bin_vendored = "3.2.0"
+indexmap = "2.7.1"
+tempfile = "3.14.0"
+command = "powershell -ExecutionPolicy Bypass -File scripts/generate-proto.ps1"

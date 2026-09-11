@@ -1,0 +1,21 @@
+[package]
+name = "gonka-proto-gen"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+publish = false
+license = "BUSL-1.1"
+
+# This is intentionally a separate host-only workspace. It must never become a
+# dependency of the Wasm contracts or participate in their release build.
+[workspace]
+
+[dependencies]
+prost-build = "=0.12.6"
+protoc-bin-vendored = "=3.2.0"
+# prost-build allows any indexmap 1.x/2.x. Newest 2.x uses edition 2024,
+# therefore the host graph needs the same explicit MSRV discipline as Wasm.
+indexmap = "=2.7.1"
+# Directly pinned to keep prost-build's host-only transitive graph compatible
+# with Cargo/Rust 1.81 (newer tempfile releases use edition 2024 dependencies).
+tempfile = "=3.14.0"

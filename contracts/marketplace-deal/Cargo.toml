@@ -1,0 +1,33 @@
+[package]
+name = "marketplace-deal"
+description = "Isolated escrow contract for one Gonka forward deal"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[example]]
+name = "deal-schema"
+path = "examples/schema.rs"
+
+[features]
+default = []
+library = []
+
+[dependencies]
+cosmwasm-schema.workspace = true
+cosmwasm-std.workspace = true
+cw-storage-plus.workspace = true
+cw2.workspace = true
+cw20.workspace = true
+cw-utils.workspace = true
+gonka-proto.workspace = true
+marketplace-api.workspace = true
+marketplace-common.workspace = true
+prost.workspace = true
+thiserror.workspace = true

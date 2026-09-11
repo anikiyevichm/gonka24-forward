@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gonka.ai/marketplace/schemas/deployment-config-1.0.0.json",
+  "title": "Gonka Marketplace deployment config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "network_class", "chain_id", "rpc_endpoint", "expected_gonka_source_sha", "build_manifest_sha256", "settlement_cw20", "settlement_cw20_decimals", "fee_recipient", "fee_bps", "factory_label", "tx", "runtime_evidence"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "kind": {"const": "gonka-marketplace-deployment-config"},
+    "network_class": {"enum": ["local", "testnet", "production"]},
+    "chain_id": {"type": "string", "minLength": 1},
+    "rpc_endpoint": {"type": "string", "pattern": "^https?://"},
+    "expected_gonka_source_sha": {"const": "379bebced638aeb5e6077bfd51c986f898443832"},
+    "build_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "settlement_cw20": {"type": "string", "minLength": 1},
+    "settlement_cw20_decimals": {"const": 6},
+    "fee_recipient": {"type": "string", "minLength": 1},
+    "fee_bps": {"const": 150},
+    "factory_label": {"type": "string", "minLength": 1},
+    "tx": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "gas", "gas_adjustment"],
+      "properties": {
+        "from": {"type": "string", "minLength": 1},
+        "gas": {"type": "string", "minLength": 1},
+        "gas_adjustment": {"type": "string", "minLength": 1}
+      }
+    },
+    "runtime_evidence": {"anyOf": [{"$ref": "#/$defs/runtimeEvidence"}, {"type": "null"}]}
+  },
+  "allOf": [{
+    "if": {"properties": {"network_class": {"const": "production"}}},
+    "then": {"properties": {"runtime_evidence": {"$ref": "#/$defs/runtimeEvidence"}}},
+    "else": {"properties": {"runtime_evidence": {"type": "null"}}}
+  }],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "runtimeEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "runtime", "target", "check_reports"],
+      "properties": {
+        "schema_version": {"const": "1.0.0"},
+        "kind": {"const": "gonka-marketplace-release-evidence"},
+        "runtime": {"$ref": "#/$defs/runtimeIdentity"},
+        "target": {"$ref": "#/$defs/releaseTarget"},
+        "check_reports": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["B1_allowlisted_grpc", "B3_gas_pruning_bounds", "B4_runtime_and_claimed_safety", "B5_golden_e2e", "B6_production_parameters_and_operations"],
+          "properties": {
+            "B1_allowlisted_grpc": {"$ref": "#/$defs/evidenceFile"},
+            "B3_gas_pruning_bounds": {"$ref": "#/$defs/evidenceFile"},
+            "B4_runtime_and_claimed_safety": {"$ref": "#/$defs/evidenceFile"},
+            "B5_golden_e2e": {"$ref": "#/$defs/evidenceFile"},
+            "B6_production_parameters_and_operations": {"$ref": "#/$defs/evidenceFile"}
+          }
+        }
+      }
+    },
+    "runtimeIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_sha", "binary_version", "binary_sha256"],
+      "properties": {
+        "source_sha": {"$ref": "#/$defs/nonzeroGitSha"},
+        "binary_version": {"type": "string", "minLength": 1},
+        "binary_sha256": {"$ref": "#/$defs/nonzeroSha256"}
+      }
+    },
+    "releaseTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network_class", "chain_id", "rpc_endpoint", "network_fingerprint_sha256", "pinned_interface_source_sha", "build_manifest_sha256", "runtime_source_sha", "runtime_binary_version", "runtime_binary_sha256", "deal_wasm_sha256", "factory_wasm_sha256", "settlement_cw20", "settlement_cw20_decimals", "fee_recipient", "fee_bps", "factory_label", "tx_from", "tx_gas", "tx_gas_adjustment"],
+      "properties": {
+        "network_class": {"const": "production"},
+        "chain_id": {"type": "string", "minLength": 1},
+        "rpc_endpoint": {"type": "string", "pattern": "^https://"},
+        "network_fingerprint_sha256": {"$ref": "#/$defs/nonzeroSha256"},
+        "pinned_interface_source_sha": {"$ref": "#/$defs/nonzeroGitSha"},
+        "build_manifest_sha256": {"$ref": "#/$defs/nonzeroSha256"},
+        "runtime_source_sha": {"$ref": "#/$defs/nonzeroGitSha"},
+        "runtime_binary_version": {"type": "string", "minLength": 1},
+        "runtime_binary_sha256": {"$ref": "#/$defs/nonzeroSha256"},
+        "deal_wasm_sha256": {"$ref": "#/$defs/nonzeroSha256"},
+        "factory_wasm_sha256": {"$ref": "#/$defs/nonzeroSha256"},
+        "settlement_cw20": {"type": "string", "minLength": 1},
+        "settlement_cw20_decimals": {"const": 6},
+        "fee_recipient": {"type": "string", "minLength": 1},
+        "fee_bps": {"const": 150},
+        "factory_label": {"type": "string", "minLength": 1},
+        "tx_from": {"type": "string", "minLength": 1},
+        "tx_gas": {"type": "string", "minLength": 1},
+        "tx_gas_adjustment": {"type": "string", "minLength": 1}
+      }
+    },
+    "evidenceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/nonzeroSha256"}}
+    },
+    "nonzeroSha256": {"type": "string", "pattern": "^(?!0{64}$)[0-9a-f]{64}$"},
+    "nonzeroGitSha": {"type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$"},
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "app_state": {
+    "gov": {
+      "params": {
+        "expedited_voting_period": "15s"
+      }
+    },
+    "inference": {
+      "params": {
+        "poc_params": {
+          "models": [
+            {
+              "model_id": "Qwen/Qwen2.5-7B-Instruct",
+              "seq_len": "256"
+            }
+          ],
+          "poc_v2_enabled": true,
+          "validation_slots": "2",
+          "poc_normalization_enabled": false
+        }
+      }
+    }
+  }
+}

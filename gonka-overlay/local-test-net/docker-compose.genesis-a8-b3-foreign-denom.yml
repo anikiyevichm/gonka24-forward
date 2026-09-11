@@ -1,0 +1,13 @@
+services:
+  chain-node:
+    volumes:
+      # Use the immutable snapshot's script; no image rebuild or production
+      # runtime change is needed for this test-only genesis fixture.
+      - ./inference-chain/scripts/init-docker-genesis.sh:/root/init-docker-genesis.sh:ro
+    environment:
+      # Fixed test mnemonic/address is imported only by the B3 selector after
+      # genesis. The init script adds this balance with Cosmos SDK's normal
+      # genesis command, which also updates bank supply.
+      A8_B3_FOREIGN_ADDRESS: gonka1k4swv40ur28fvu54p8mskjj4lxkgsj07u9f8ny
+      A8_B3_FOREIGN_DENOM: ua8b3foreign
+      A8_B3_FOREIGN_AMOUNT: "12345"

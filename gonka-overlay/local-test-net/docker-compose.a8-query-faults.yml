@@ -1,0 +1,15 @@
+# Only package-c-query-faults uses this overlay. Restart an initialized node
+# without replaying genesis-init; never erase or regenerate consensus state.
+services:
+  chain-node:
+    command:
+      - sh
+      - -ec
+      - |
+        if [ -s /root/.inference/config/genesis.json ] && [ -f /root/.inference/data/priv_validator_state.json ] && [ -x /root/.inference/cosmovisor/current/bin/inferenced ]; then
+          exec cosmovisor run start
+        elif [ "$${IS_GENESIS:-false}" = true ]; then
+          exec sh ./init-docker-genesis.sh
+        else
+          exec sh ./init-docker.sh
+        fi
