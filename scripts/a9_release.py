@@ -80,6 +80,8 @@ CONTRACT_FILES = {
     "marketplace-deal": "marketplace_deal.wasm",
     "marketplace-factory": "marketplace_factory.wasm",
 }
+OPTIMIZER_DNS_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0)
+OPTIMIZER_RUSTUP_TOOLCHAIN = "1.81.0-x86_64-unknown-linux-musl"
 
 
 class ToolError(RuntimeError):
@@ -482,6 +484,46 @@ def run_checked(runner: CommandRunner, argv: Sequence[str], timeout: float | Non
     return result
 
 
+def run_optimizer_checked(
+    runner: CommandRunner,
+    argv: Sequence[str],
+    *,
+    sleep: Any = time.sleep,
+) -> tuple[CommandResult, int]:
+    """Retry only the observed rustup DNS failure, preserving fail-closed builds."""
+    for attempt in range(1, len(OPTIMIZER_DNS_RETRY_DELAYS_SECONDS) + 2):
+        result = runner.run(argv)
+        if result.returncode == 0:
+            return result, attempt
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+        normalized = detail.lower()
+        transient_dns = (
+            any(
+                host in normalized
+                for host in ("static.rust-lang.org", "index.crates.io", "static.crates.io")
+            )
+            and any(
+                marker in normalized
+                for marker in (
+                    "dns error",
+                    "failed to lookup address",
+                    "couldn't resolve host",
+                    "could not resolve host",
+                )
+            )
+        )
+        if not transient_dns or attempt > len(OPTIMIZER_DNS_RETRY_DELAYS_SECONDS):
+            raise ToolError(f"command failed: {display_command(argv)}: {detail}")
+        delay = OPTIMIZER_DNS_RETRY_DELAYS_SECONDS[attempt - 1]
+        print(
+            f"optimizer transient DNS failure on attempt {attempt}; retrying in {delay:g}s: {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sleep(delay)
+    raise AssertionError("optimizer retry loop exhausted without returning")
+
+
 def parse_json_output(result: CommandResult, context: str) -> dict[str, Any]:
     try:
         value = json.loads(result.stdout)
@@ -512,6 +554,73 @@ def git_blob(repo: Path, commit: str, path: str) -> bytes:
     return result.stdout
 
 
+def safe_extract_tar(bundle: tarfile.TarFile, destination: Path) -> None:
+    """Extract source safely even on Python versions without tar filters."""
+    root = destination.resolve()
+    directories: list[tuple[tarfile.TarInfo, Path]] = []
+    files: list[tuple[tarfile.TarInfo, Path]] = []
+    links: list[tuple[tarfile.TarInfo, Path]] = []
+
+    for member in bundle.getmembers():
+        target = (destination / member.name).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ToolError(f"unsafe path in git archive: {member.name}") from exc
+
+        if member.isdir():
+            directories.append((member, target))
+        elif member.isreg():
+            files.append((member, target))
+        elif member.issym():
+            link_name = member.linkname
+            if Path(link_name).is_absolute() or re.match(r"^[A-Za-z]:[\\\\/]", link_name):
+                raise ToolError(f"unsafe symlink target in git archive: {member.name}")
+            link_target = (target.parent / link_name).resolve()
+            try:
+                link_target.relative_to(root)
+            except ValueError as exc:
+                raise ToolError(f"unsafe symlink target in git archive: {member.name}") from exc
+            links.append((member, target))
+        else:
+            raise ToolError(f"unsupported archive member type: {member.name}")
+
+    for _, target in directories:
+        target.mkdir(parents=True, exist_ok=True)
+    for member, target in files:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = bundle.extractfile(member)
+        if content is None:
+            raise ToolError(f"archive member has no readable content: {member.name}")
+        with content, target.open("xb") as extracted:
+            shutil.copyfileobj(content, extracted)
+        target.chmod(member.mode & 0o777)
+    # Links are created last so a later file cannot traverse a symlink that
+    # appeared earlier in the archive.
+    created_links: list[Path] = []
+    try:
+        for member, target in links:
+            # An earlier link may have changed the meaning of this parent.
+            parent = target.parent.resolve()
+            if not parent.is_relative_to(root):
+                raise ToolError(f"unsafe symlink parent in git archive: {member.name}")
+            parent.mkdir(parents=True, exist_ok=True)
+            target = parent / target.name
+            os.symlink(member.linkname, target)
+            created_links.append(target)
+        # Forward references must be checked after *all* links exist: individually
+        # safe targets can form an escaping chain (d/b -> .., escape -> d/b/..).
+        for target in created_links:
+            try:
+                target.resolve(strict=False).relative_to(root)
+            except (ValueError, OSError, RuntimeError) as exc:
+                raise ToolError(f"unsafe symlink target in git archive: {target}") from exc
+    except Exception:
+        for target in reversed(created_links):
+            target.unlink()
+        raise
+
+
 def extract_git_archive(repo: Path, commit: str, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=False)
     archive = destination.parent / "source.tar"
@@ -520,14 +629,7 @@ def extract_git_archive(repo: Path, commit: str, destination: Path) -> None:
         raise ToolError(result.stderr.strip() or "git archive failed")
     try:
         with tarfile.open(archive) as bundle:
-            root = destination.resolve()
-            for member in bundle.getmembers():
-                target = (destination / member.name).resolve()
-                try:
-                    target.relative_to(root)
-                except ValueError as exc:
-                    raise ToolError(f"unsafe path in git archive: {member.name}") from exc
-            bundle.extractall(destination, filter="data")
+            safe_extract_tar(bundle, destination)
     finally:
         archive.unlink(missing_ok=True)
 
@@ -535,6 +637,14 @@ def extract_git_archive(repo: Path, commit: str, destination: Path) -> None:
 def ensure_reproducible_builds(first: Mapping[str, str], second: Mapping[str, str]) -> None:
     if dict(first) != dict(second):
         raise ToolError(f"independent optimizer builds differ: {dict(first)} != {dict(second)}")
+
+
+def optimizer_docker_command(source: Path | str, image: str) -> list[str]:
+    return [
+        "docker", "run", "--rm", "--platform", OPTIMIZER_PLATFORM,
+        "-e", f"RUSTUP_TOOLCHAIN={OPTIMIZER_RUSTUP_TOOLCHAIN}",
+        "--mount", f"type=bind,source={source},target=/code", image,
+    ]
 
 
 def build_release(repo: Path, output: Path, commit_ref: str, runner: CommandRunner) -> Path:
@@ -554,19 +664,15 @@ def build_release(repo: Path, output: Path, commit_ref: str, runner: CommandRunn
     image = f"{OPTIMIZER_IMAGE}@{OPTIMIZER_DIGEST}"
     build_hashes: list[dict[str, str]] = []
     command_records: list[list[str]] = []
+    optimizer_attempts: list[int] = []
     for number in (1, 2):
         source = output / f"build-{number}" / "source"
         extract_git_archive(repo, commit, source)
-        docker_argv = [
-            "docker", "run", "--rm", "--platform", OPTIMIZER_PLATFORM,
-            "--mount", f"type=bind,source={source},target=/code", image,
-        ]
-        recorded = [
-            "docker", "run", "--rm", "--platform", OPTIMIZER_PLATFORM,
-            "--mount", f"type=bind,source=<build-{number}/source>,target=/code", image,
-        ]
+        docker_argv = optimizer_docker_command(source, image)
+        recorded = optimizer_docker_command(f"<build-{number}/source>", image)
         command_records.append(recorded)
-        run_checked(runner, docker_argv)
+        _result, attempts = run_optimizer_checked(runner, docker_argv)
+        optimizer_attempts.append(attempts)
         artifacts = source / "artifacts"
         hashes: dict[str, str] = {}
         for filename in CONTRACT_FILES.values():
@@ -626,8 +732,8 @@ def build_release(repo: Path, output: Path, commit_ref: str, runner: CommandRunn
         "checks": {
             "source_tree_clean": {"status": "pass", "command": ["git", "status", "--porcelain=v1", "--", *SOURCE_PATHS]},
             "committed_lockfiles": {"status": "pass", "paths": ["Cargo.lock", "tools/proto-gen/Cargo.lock"]},
-            "optimizer_build_1": {"status": "pass", "command": command_records[0], "sha256": build_hashes[0]},
-            "optimizer_build_2": {"status": "pass", "command": command_records[1], "sha256": build_hashes[1]},
+            "optimizer_build_1": {"status": "pass", "command": command_records[0], "attempts": optimizer_attempts[0], "sha256": build_hashes[0]},
+            "optimizer_build_2": {"status": "pass", "command": command_records[1], "attempts": optimizer_attempts[1], "sha256": build_hashes[1]},
             "reproducible_wasm": {"status": "pass", "details": "both independent optimizer outputs are byte-identical"},
             "cosmwasm_check": {"status": "pass", "command": ["cosmwasm-check", *[f"wasm/{name}" for name in CONTRACT_FILES.values()]], "output": check_result.stdout.strip()},
         },

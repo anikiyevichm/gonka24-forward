@@ -1,4 +1,5 @@
 /target/
+/ops/a8/harness/wasm-probe/p0-probe/target/
 /tools/proto-gen/target/
 __pycache__/
 *.pyc
@@ -27,3 +28,7 @@ htmlcov/
 #ai
 *.local.md
 
+# A8 Acceptance bundles and local outputs
+.a8-bundles/
+.e2e-bridge*/
+out/

@@ -6,10 +6,12 @@
 > Historical PASS statuses validate specific test suites against the recorded source states and do
 > not constitute automatic verification of newer builds.
 
-The agreed acceptance scope is closed for merge: native (including C1/E),
+The historical A8 acceptance scope was closed for the source revisions in the
+register below: native (including C1/E),
 Go classification/JSON, compiled-Wasm synthetic-host ABI, and contract policy tests.
-No additional live runs are required. The limitations of the proof levels below are
-preserved; they are not turned into new merge gates. The unified runner is a subsequent task.
+That decision did not cover PR #27's new immutable-source runner or its current
+product commit. Those changes require their own recorded validation before a
+current live-verification claim. The proof-level limitations below remain in force.
 
 Date: 2026-09-10. This is the authoritative summary superseding historical TODOs in
 package handoffs and earlier gap analyses. Verification was performed directly without
@@ -70,9 +72,9 @@ Gonka Testermint. Python commands are in `scripts/a8_acceptance.py`. C case name
 | G1 / R6.1 | N fault | marketplace R6 dot 1 rejects all three selected CW20 sends then settles once | PASS B6, Host/fee/Buyer send positions |
 | G1 / R6.2 | N fault | refund-scenario --fault-cw20 routing-mismatch | PASS N17 raw cw20_fault_rollback before=after; then full refund and terminal repeat |
 | G1 / R6.3 | N fault | C r6.3 → r5-cancel-e3 | PASS C, CW20 rollback with active summary fault, then refund |
-| G2 / R7.1 | N fault | marketplace R7 dot 1 rejects selected second Bank send then retries once | PASS B7, both Bank send positions, retry and repeat |
+| G2 / R7.1 | N fault | marketplace R7 dot 1 rejects the selected second payout position under a native Bank restriction, then retries once | PASS B7, restriction rejection, atomic rollback, retry and repeat. The chain receipt does not expose the failing message index; that position is bound to the release oracle. |
 | G2 / R7.2 | N reviewed | C bank-fault/bank-retry; native_bank_release_retry | PASS C via raw context: h716 release, h717 repeat. Summary row omitted due to timeout |
-| G3 | N | marketplace terminal release repeat is a native no-op | PASS G3: method name is historical; expected included NothingToRelease, not a successful no-op |
+| G3 | N | marketplace terminal release repeat rejects without payout | Historical suite receipt is FAIL (`g3-terminal-release-repeat-002.json`); semantic review of the included DeliverTx found `NothingToRelease`, unchanged state/balances and no repeat payout. This is not a successful no-op or a current-source E2E PASS. |
 
 ## Accepted Additional Level Checks and Their Boundaries
 

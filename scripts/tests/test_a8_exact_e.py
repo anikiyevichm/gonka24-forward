@@ -1,10 +1,19 @@
+"""Exact-epoch E1 lock scenario tests for scripts/a8_acceptance.py.
+
+All fixtures are synthetic. No network, Docker, or live chain calls.
+"""
+
 import copy
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-import a8_acceptance as a
+
+try:
+    from scripts.tests.support import a8 as a
+except ImportError:
+    from support import a8 as a
 
 
 class ExactELockTests(unittest.TestCase):

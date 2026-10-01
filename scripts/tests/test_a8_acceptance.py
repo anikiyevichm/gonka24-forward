@@ -1,5 +1,15 @@
+"""Unit tests for the A8 acceptance harness (scripts/a8_acceptance.py).
+
+All fixtures are synthetic. No network, Docker, or live chain calls.
+"""
+
+import contextlib
+import copy
+import hashlib
 import importlib.util
+import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -8,82 +18,378 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+# Direct execution puts scripts/tests, rather than the repository root, on sys.path.
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "a8_acceptance.py"
-sys.path.insert(0, str(MODULE_PATH.parent))
-SPEC = importlib.util.spec_from_file_location("a8_acceptance", MODULE_PATH)
-assert SPEC is not None and SPEC.loader is not None
-a8 = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = a8
-SPEC.loader.exec_module(a8)
-
-
-class FakeRunner:
-    def __init__(self, results):
-        self.results = list(results)
-        self.calls = []
-
-    def run(self, argv, *, input_text=None, timeout=None):
-        self.calls.append((list(argv), input_text, timeout))
-        if not self.results:
-            raise AssertionError(f"unexpected command: {argv}")
-        return self.results.pop(0)
+from ops.a8.tests.real_fixtures import (
+    ordered_vesting_addition_phase, real_lock_exact_e_context, real_vesting_addition_phase,
+)
+from ops.a8.verifier import _validate_vesting_addition
 
 
-class StubGonka:
-    def __init__(self, chain_id, status):
-        self.chain_id = chain_id
-        self._status = status
-
-    def status(self):
-        return self._status
-
-
-class BankRollbackGonka:
-    def __init__(self, attempt):
-        self.chain_id = a8.DEFAULT_CHAIN_ID
-        self.attempt = attempt
-
-    def status(self):
-        return {"node_info": {"network": a8.DEFAULT_CHAIN_ID}, "sync_info": {"catching_up": False}}
-
-    def transfer_restriction_status(self):
-        return {"is_active": True, "remaining_blocks": 10, "current_block_height": 100}
-
-    def smart(self, _contract, _query):
-        return {
-            "status": "releasing",
-            "released_total_ngonka": "0",
-            "buyer_released_ngonka": "0",
-            "host_released_ngonka": "0",
-            "gnk_release_policy": "host_only",
-        }
-
-    def cw20_balance(self, _contract, _address):
-        return 0
-
-    def bank_balance(self, address):
-        return 100 if address == "deal" else 0
-
-    def tx_attempt(self, *_args, **_kwargs):
-        return dict(self.attempt)
+from scripts.tests.support import (
+    BankRollbackGonka,
+    FakeRunner,
+    MODULE_PATH,
+    StubGonka,
+    a8,
+)
 
 
 class A8AcceptanceTests(unittest.TestCase):
-    def test_runtime_adapter_requires_exact_reviewed_blobs(self):
-        head = "a" * 40
-        paths = list(a8.A8_RUNTIME_ADAPTER_BLOBS)
-        prefix = [subprocess.CompletedProcess([], 0, head, ""),
-                  subprocess.CompletedProcess([], 0, "\n".join(paths), "")]
-        good = [subprocess.CompletedProcess([], 0, blob, "")
-                for blob in a8.A8_RUNTIME_ADAPTER_BLOBS.values()]
-        self.assertEqual(a8.verify_gonka_test_checkout(Path("gonka"), FakeRunner(prefix + good)), head)
-        with self.assertRaisesRegex(a8.AcceptanceError, "unreviewed A8 runtime"):
-            a8.verify_gonka_test_checkout(Path("gonka"), FakeRunner(prefix + [subprocess.CompletedProcess([], 0, "wrong", "")]))
+    def test_unfunded_e4_lock_records_a_tx_bound_epoch_bracket(self):
+        context = {
+            "chain": {"chain_id": a8.DEFAULT_CHAIN_ID},
+            "scenarios": {"lock-e-plus-4": {
+                "terms": {"target_epoch": 100},
+                "contracts": {"deal": "deal-e4"},
+                "accounts": {"host": "host"},
+                "phases": [],
+            }},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.json"
+            path.write_text(json.dumps(context), encoding="utf-8")
+
+            class LockGonka:
+                def __init__(self, events=None):
+                    self.events = events or []
+                    self.states = iter((
+                        {"status": "open", "buyer": None, "recipient_locked": False},
+                        {"status": "locked", "buyer": None, "recipient_locked": True},
+                    ))
+
+                def query_json(self, *_args):
+                    return {"entries": [{"epoch": 100, "recipient": "deal-e4"}]}
+
+                def smart(self, *_args):
+                    return next(self.states)
+
+                def execute(self, *_args, **_kwargs):
+                    return {"code": 0, "txhash": "E4TX", "height": "201", "events": self.events}
+
+            with (
+                patch.object(a8, "DockerGonka", return_value=LockGonka()),
+                patch.object(a8, "Runner", lambda: object()),
+                patch.object(a8, "assert_chain"),
+                patch.object(a8, "epoch_observation", side_effect=(
+                    {"epoch": 104, "height": 200}, {"epoch": 104, "height": 202},
+                )),
+                patch.object(a8, "assert_tx_epoch_bracket", return_value={
+                    "same_epoch": True, "epoch": 104,
+                    "before_height": 200, "tx_height": 201, "after_height": 202,
+                }),
+            ):
+                a8.lock_scenario(SimpleNamespace(context=str(path), name="lock-e-plus-4"))
+
+            phase = json.loads(path.read_text(encoding="utf-8"))["scenarios"]["lock-e-plus-4"]["phases"][0]
+            self.assertEqual(phase["expected_epoch"], 104)
+            self.assertEqual(phase["epoch_bracket"]["tx_height"], 201)
+
+            bad_path = Path(directory) / "bad-context.json"
+            bad_path.write_text(json.dumps(context), encoding="utf-8")
+            outgoing = {"type": "transfer", "attributes": [
+                {"key": "sender", "value": "deal-e4"},
+                {"key": "recipient", "value": "buyer"},
+                {"key": "amount", "value": "1ngonka"},
+            ]}
+            with (
+                patch.object(a8, "DockerGonka", return_value=LockGonka([outgoing])),
+                patch.object(a8, "Runner", lambda: object()),
+                patch.object(a8, "assert_chain"),
+                patch.object(a8, "epoch_observation", side_effect=(
+                    {"epoch": 104, "height": 200}, {"epoch": 104, "height": 202},
+                )),
+                patch.object(a8, "assert_tx_epoch_bracket", return_value={
+                    "same_epoch": True, "epoch": 104,
+                    "before_height": 200, "tx_height": 201, "after_height": 202,
+                }),
+            ):
+                with self.assertRaisesRegex(a8.AcceptanceError, "Bank transfer involving Deal"):
+                    a8.lock_scenario(SimpleNamespace(context=str(bad_path), name="lock-e-plus-4"))
+            self.assertEqual(
+                json.loads(bad_path.read_text(encoding="utf-8"))["scenarios"]["lock-e-plus-4"]["phases"],
+                [],
+            )
+
+    def test_unfunded_e5_rejection_records_a_tx_bound_epoch_bracket(self):
+        context = {
+            "chain": {"chain_id": a8.DEFAULT_CHAIN_ID},
+            "scenarios": {"lock-e-plus-5": {
+                "terms": {"target_epoch": 100},
+                "contracts": {"deal": "deal-e5"},
+                "accounts": {"host": "host"},
+                "phases": [],
+            }},
+        }
+        snapshot = {
+            "state": {"status": "open", "buyer": None, "recipient_locked": False},
+            "cw20": {"deal": 0}, "bank_ngonka": {"deal": 0},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.json"
+            path.write_text(json.dumps(context), encoding="utf-8")
+
+            class RejectGonka:
+                def query_json(self, *_args):
+                    return {"entries": []}
+
+                def tx_attempt(self, *_args, **_kwargs):
+                    return {
+                        "code": 5, "txhash": "E5TX", "height": "301",
+                        "codespace": "wasm", "raw_log": "lock window is closed",
+                    }
+
+            with (
+                patch.object(a8, "DockerGonka", return_value=RejectGonka()),
+                patch.object(a8, "Runner", lambda: object()),
+                patch.object(a8, "assert_chain"),
+                patch.object(a8, "scenario_financial_snapshot", return_value=copy.deepcopy(snapshot)),
+                patch.object(a8, "epoch_observation", side_effect=(
+                    {"epoch": 105, "height": 300}, {"epoch": 105, "height": 302},
+                )),
+                patch.object(a8, "assert_tx_epoch_bracket", return_value={
+                    "same_epoch": True, "epoch": 105,
+                    "before_height": 300, "tx_height": 301, "after_height": 302,
+                }),
+            ):
+                a8.lock_rejected_scenario(SimpleNamespace(
+                    context=str(path), name="lock-e-plus-5", routing="pruned", gas=2_000_000,
+                ))
+
+            phase = json.loads(path.read_text(encoding="utf-8"))["scenarios"]["lock-e-plus-5"]["phases"][0]
+            self.assertEqual(phase["expected_epoch"], 105)
+            self.assertEqual(phase["epoch_bracket"]["tx_height"], 301)
+
+    def test_native_unlock_summary_covers_every_released_coin_and_rejects_malformed_totals(self):
+        phase = ordered_vesting_addition_phase(unlock_before=True, foreign_tranche=True)
+        def reconcile(events):
+            return a8.reconcile_vesting_addition(
+                a8.vesting_epoch_amounts(phase["before"]), a8.vesting_epoch_amounts(phase["after"]),
+                phase["addition_by_epoch"], 70, events, phase["recipient"],
+                phase["proposal"]["proposal"]["messages"][0]["value"]["sender"],
+            )
+        self.assertEqual(reconcile(phase["vesting_events"]), (1, 70))
+        for total in ("1ngonka,5uatom", "70ngonka", "70ngonka,4uatom", "garbage", "-70ngonka", "0ngonka", "70ngonka,70ngonka", "70ngonka,", "70.0ngonka"):
+            with self.subTest(total=total):
+                events = copy.deepcopy(phase["vesting_events"])
+                events[0]["attributes"][0]["value"] = total
+                with self.assertRaisesRegex(a8.AcceptanceError, "unlock amount"):
+                    reconcile(events)
+
+    def test_vesting_observation_rejects_a_schedule_for_another_participant(self):
+        phase = ordered_vesting_addition_phase(unlock_before=True)
+        status = real_lock_exact_e_context()["chain"]["status"]
+        for replacement in (None, "different-participant"):
+            with self.subTest(replacement=replacement):
+                response = copy.deepcopy(phase["after"])
+                if replacement is None:
+                    response["vesting_schedule"].pop("participant_address")
+                else:
+                    response["vesting_schedule"]["participant_address"] = replacement
+                runner = FakeRunner([a8.CommandResult(0, json.dumps(value), "") for value in (status, response)])
+                with self.assertRaisesRegex(a8.AcceptanceError, "participant differs"):
+                    a8.vesting_observation(a8.DockerGonka(runner), phase["recipient"])
+
+    def test_vesting_reads_stay_at_the_observed_height_when_latest_state_advances(self):
+        status = real_lock_exact_e_context()["chain"]["status"]
+        phase = real_vesting_addition_phase()
+        height = status["sync_info"]["latest_block_height"]
+        schedule = phase["after"]
+        deal = schedule["vesting_schedule"]["participant_address"]
+
+        class AdvancingRunner:
+            def run(self, argv, **kwargs):
+                if "status" in argv:
+                    value = status
+                else:
+                    # Latest state has already advanced: only an explicit height
+                    # may return the original schedule, epoch and balance together.
+                    pinned = "--height" in argv and argv[argv.index("--height") + 1] == height
+                    if "vesting-schedule" in argv:
+                        value = schedule if pinned else phase["before"]
+                    elif "get-current-epoch" in argv:
+                        value = {"epoch": phase["epoch"] if pinned else phase["epoch"] + 1}
+                    elif "balance" in argv:
+                        value = {"balance": {"denom": "ngonka", "amount": "0" if pinned else "5000000001"}}
+                    else:
+                        raise AssertionError(argv)
+                return a8.CommandResult(0, json.dumps(value), "")
+
+        observation = a8.vesting_observation(a8.DockerGonka(AdvancingRunner()), deal)
+        self.assertEqual(observation, {
+            "height": int(height), "schedule": schedule,
+            "epoch": phase["epoch"], "bank_balance_ngonka": 0,
+        })
+
+    def test_vesting_height_zero_is_rejected_instead_of_querying_unpinned_latest_state(self):
+        status = real_lock_exact_e_context()["chain"]["status"]
+        status["sync_info"]["latest_block_height"] = "0"
+        runner = FakeRunner([a8.CommandResult(0, json.dumps(status), "")])
+        with self.assertRaisesRegex(a8.AcceptanceError, "requires a committed block"):
+            a8.vesting_observation(a8.DockerGonka(runner), "deal")
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_primary_and_named_deals_accept_an_empty_release_only_after_completion(self):
+        class CompletedGonka:
+            def __init__(self, *_args, **_kwargs):
+                self.state = {
+                    "status": "completed",
+                    "released_total_ngonka": "100",
+                    "buyer_released_ngonka": "20",
+                    "host_released_ngonka": "80",
+                }
+
+            def key_address(self, *_args):
+                return "caller"
+
+            def bank_balance(self, address):
+                return {"deal": 0, "host": 80, "buyer": 20, "caller": 100}[address]
+
+            def smart(self, *_args):
+                return dict(self.state)
+
+            def cw20_balance(self, *_args):
+                return 7
+
+            def tx_attempt(self, *_args, **_kwargs):
+                return {
+                    "layer": "deliver_tx",
+                    "tx_hash": "REPEAT",
+                    "height": "44",
+                    "code": 5,
+                    "codespace": "wasm",
+                    "raw_log": "no additional GNK is currently available for release",
+                }
+
+            def wait_tx_any(self, _tx_hash):
+                return {"tx_hash": "REPEAT", "height": "44", "code": 5, "events": []}
+
+        context = {
+            "chain": {"chain_id": a8.DEFAULT_CHAIN_ID},
+            "contracts": {"foreign_cw20": "foreign"},
+            "accounts": {"buyer": "buyer"},
+            "scenarios": {
+                "done": {
+                    "contracts": {"deal": "deal"},
+                    "accounts": {"host": "host", "buyer": "buyer"},
+                    "phases": [],
+                }
+            },
+        }
+        # Exercise the primary Deal route used by the funded lifecycle as well
+        # as named scenarios. A drained but unfinished Deal must still fail.
+        for name in ("done", "bootstrap"):
+            for status in ("completed", "releasing"):
+                with self.subTest(name=name, status=status), tempfile.TemporaryDirectory() as directory:
+                    selected_context = json.loads(json.dumps(context))
+                    if name == "bootstrap":
+                        selected_context["contracts"].update(context["scenarios"]["done"]["contracts"])
+                        selected_context["accounts"].update(context["scenarios"]["done"]["accounts"])
+                        selected_context["phases"] = []
+                    path = Path(directory) / "context.json"
+                    path.write_text(json.dumps(selected_context), encoding="utf-8")
+                    gonka = CompletedGonka()
+                    gonka.state["status"] = status
+                    with (
+                        patch.object(a8, "DockerGonka", return_value=gonka),
+                        patch.object(a8, "Runner", lambda: object()),
+                        patch.object(a8, "assert_chain"),
+                        patch.object(a8, "epoch_observation", return_value={"epoch": 8, "height": 44}),
+                        patch.object(a8, "assert_tx_epoch_bracket", return_value={"epoch": 8}),
+                    ):
+                        args = SimpleNamespace(context=str(path), name=name)
+                        if status == "completed":
+                            a8.release_scenario(args)
+                        else:
+                            with self.assertRaisesRegex(a8.AcceptanceError, "no spendable ngonka"):
+                                a8.release_scenario(args)
+
+                    saved = json.loads(path.read_text(encoding="utf-8"))
+                    phases = saved["phases"] if name == "bootstrap" else saved["scenarios"][name]["phases"]
+                    if status != "completed":
+                        self.assertEqual(phases, [])
+                        continue
+                    phase = phases[-1]
+                    self.assertEqual(phase["name"], "release_repeat_rejected")
+                    self.assertEqual(phase["deal"], "deal")
+                    self.assertEqual(phase["terminal_rejection"]["contract_error"], "NothingToRelease")
+                    self.assertEqual(phase["before"], phase["after"])
+                    self.assertEqual(phase["before_state"], phase["after_state"])
+
+    def test_verify_claimed_allows_cold_dapi_auto_claim_window(self):
+        args = a8.parser().parse_args(
+            [
+                "verify-claimed-scenario",
+                "--context",
+                "evidence.json",
+                "--name",
+                "funded",
+                "--require-positive",
+            ]
+        )
+        self.assertEqual(args.wait_seconds, 300)
+        self.assertTrue(args.require_positive)
+
+    def test_runtime_adapter_refuses_legacy_overlay_variables_and_requires_pristine_snapshot(self):
+        base_sha = "1" * 40
+        pristine_snap = {
+            "schema": "a8.source-snapshot/1",
+            "head": base_sha,
+            "tree": "2" * 40,
+            "index_matches_head": True,
+            "tracked_files": 3,
+            "tracked_digest": "a" * 64,
+            "missing_tracked": [],
+            "status": [],
+            "submodules": [],
+            "forbidden": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence_dir = Path(tmp)
+            a8.assert_snapshots_pristine(
+                evidence_dir,
+                {"gonka": base_sha},
+                {"gonka": pristine_snap},
+            )
+            self.assertFalse((evidence_dir / "source-immutability.json").exists())
+
+            dirty_snap = {
+                **pristine_snap,
+                "status": ["?? testermint/src/test/kotlin/MarketplaceContractAcceptanceTests.kt"],
+            }
+            with self.assertRaisesRegex(a8.HarnessRefusal, "SOURCE_TREE_DIRTY"):
+                a8.assert_snapshots_pristine(
+                    evidence_dir,
+                    {"gonka": base_sha},
+                    {"gonka": dirty_snap},
+                )
+            recorded = json.loads((evidence_dir / "source-immutability.json").read_text(encoding="utf-8"))
+            self.assertEqual(recorded["verdict"], "VIOLATED")
+
+    def test_runtime_adapter_refuses_removed_overlay_environment_variables(self):
+        for legacy_var in a8.LEGACY_OVERLAY_ENVIRONMENT:
+            with self.subTest(legacy_var=legacy_var), patch.dict(
+                os.environ, {legacy_var: "1" * 40}, clear=False
+            ):
+                with self.assertRaisesRegex(a8.AcceptanceError, legacy_var):
+                    a8.refuse_legacy_overlay_environment()
 
     def test_prepared_package_selectors_are_available(self):
         for scenario in ("package-a-r1-r2", "package-b-r6-1", "package-b-r7-1"):
-            parsed = a8.parser().parse_args(["run-live", "--gonka-dir", "gonka", "--scenario", scenario])
+            parsed = a8.parser().parse_args(
+                [
+                    "run-live",
+                    "--gonka-dir",
+                    "gonka",
+                    "--expected-gonka-sha",
+                    "1" * 40,
+                    "--scenario",
+                    scenario,
+                ]
+            )
             self.assertEqual(parsed.scenario, scenario)
 
     def test_late_completed_donations_use_cumulative_rounding(self):
@@ -114,19 +420,6 @@ class A8AcceptanceTests(unittest.TestCase):
         self.assertEqual(second["buyer_delta"], 2)
         self.assertEqual(second["host_delta"], amount - 2)
         self.assertNotEqual(second["buyer_delta"], independently_floored_buyer)
-
-    @staticmethod
-    def workflow_blob_results(*, verify_blob=None):
-        return [
-            subprocess.CompletedProcess(
-                [],
-                0,
-                (verify_blob if path == ".github/workflows/verify.yml" and verify_blob else blob)
-                + "\n",
-                "",
-            )
-            for path, blob in sorted(a8.PR4_MANUAL_WORKFLOW_BLOBS.items())
-        ]
 
     @staticmethod
     def funded_settlement_fixture():
@@ -169,19 +462,25 @@ class A8AcceptanceTests(unittest.TestCase):
         return context, summary, expected, state
 
     def test_runtime_identity_requires_exact_running_gonka_and_wasm_stack(self):
+        selected_sha = "c" * 40
         output = "\n".join(
             [
                 "- github.com/CosmWasm/wasmd@v0.54.2",
                 "- github.com/CosmWasm/wasmvm/v2@v2.2.4",
-                "commit: 29a58fcf64b87967cb874b6169ce2c61e1f269b1",
+                f"commit: {selected_sha}",
                 "cosmos_sdk_version: v0.53.3-test",
                 "go: go version go1.24.2 linux/amd64",
             ]
         )
-        identity = a8.parse_runtime_identity(output)
-        self.assertEqual(identity["gonka_source_sha"], a8.EXPECTED_GONKA_SHA)
-        with self.assertRaisesRegex(a8.AcceptanceError, "runtime provenance mismatch"):
-            a8.parse_runtime_identity(output.replace("v0.54.2", "v0.54.1"))
+        with patch.dict(os.environ, {a8.ENV_EXPECTED_GONKA_SHA: selected_sha}, clear=False):
+            identity = a8.parse_runtime_identity(output)
+            self.assertEqual(identity["gonka_source_sha"], selected_sha)
+            with self.assertRaisesRegex(a8.AcceptanceError, "runtime provenance mismatch"):
+                a8.parse_runtime_identity(output.replace("v0.54.2", "v0.54.1"))
+            with self.assertRaisesRegex(a8.AcceptanceError, "runtime provenance mismatch"):
+                a8.parse_runtime_identity(
+                    output.replace(selected_sha, "29a58fcf64b87967cb874b6169ce2c61e1f269b1")
+                )
 
     def test_r61_fault_selector_binds_all_three_positions_to_distinct_recipients(self):
         context = {
@@ -252,99 +551,76 @@ class A8AcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(a8.AcceptanceError, "is zero"):
             a8.cw20_settlement_fault_targets(context, fully_sold, [3])
 
-    def test_gonka_checkout_accepts_pinned_p0_with_manual_trigger_and_b3_harness(self):
+    def test_gonka_checkout_rejects_prepared_child_with_declared_test_paths(self):
+        base_sha = "1" * 40
         updated_head = "114f914d1d362a3b60ffe13477ef572372fe7c58"
-        changed = "\n".join(
-            [
-                "inference-chain/scripts/init-docker-genesis.sh",
-                "local-test-net/docker-compose.genesis-a8-b3-foreign-denom.yml",
-                "testermint/src/main/kotlin/LocalInferencePair.kt",
-                "testermint/src/test/kotlin/DockerBindUserArgsTests.kt",
-                "testermint/src/test/kotlin/MarketplaceContractAcceptanceTests.kt",
-                "testermint/src/test/kotlin/MarketplaceHarnessProcess.kt",
-                "testermint/src/test/kotlin/MarketplaceHarnessProcessTests.kt",
-                "testermint/src/test/resources/a8-b3-genesis-validation-overrides.json",
-                ".github/workflows/verify.yml",
-            ]
-        )
-        runner = FakeRunner(
-            [
-                subprocess.CompletedProcess([], 0, updated_head + "\n", ""),
-                subprocess.CompletedProcess([], 0, changed + "\n", ""),
-                subprocess.CompletedProcess([], 0, "", ""),
-                *self.workflow_blob_results(),
-            ]
-        )
+        snap = {
+            "schema": "a8.source-snapshot/1",
+            "head": updated_head,
+            "tree": "2" * 40,
+            "index_matches_head": True,
+            "tracked_files": 3,
+            "tracked_digest": "a" * 64,
+            "missing_tracked": [],
+            "status": [],
+            "submodules": [],
+            "forbidden": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(a8.HarnessRefusal, "HEAD_MISMATCH"):
+                a8.assert_snapshots_pristine(
+                    Path(tmp),
+                    {"gonka": base_sha},
+                    {"gonka": snap},
+                )
 
-        self.assertEqual(
-            a8.verify_gonka_test_checkout(Path("gonka"), runner), updated_head
-        )
+    def test_gonka_checkout_rejects_any_extra_file_in_snapshot(self):
+        base_sha = "1" * 40
+        snap = {
+            "schema": "a8.source-snapshot/1",
+            "head": base_sha,
+            "tree": "2" * 40,
+            "index_matches_head": True,
+            "tracked_files": 3,
+            "tracked_digest": "a" * 64,
+            "missing_tracked": [],
+            "status": [
+                " M inference-chain/app/app.go",
+                "?? testermint/src/test/kotlin/MarketplaceContractAcceptanceTests.kt",
+            ],
+            "submodules": [],
+            "forbidden": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(a8.HarnessRefusal, "SOURCE_TREE_DIRTY"):
+                a8.assert_snapshots_pristine(
+                    Path(tmp),
+                    {"gonka": base_sha},
+                    {"gonka": snap},
+                )
 
-    def test_gonka_checkout_rejects_any_extra_file_beyond_timeout_harness(self):
-        updated_head = "114f914d1d362a3b60ffe13477ef572372fe7c58"
-        changed = "\n".join(
-            [
-                "testermint/src/test/kotlin/MarketplaceContractAcceptanceTests.kt",
-                "testermint/src/test/kotlin/MarketplaceHarnessProcess.kt",
-                "testermint/src/test/kotlin/MarketplaceHarnessProcessTests.kt",
-                "inference-chain/app/app.go",
-            ]
-        )
-        runner = FakeRunner(
-            [
-                subprocess.CompletedProcess([], 0, updated_head + "\n", ""),
-                subprocess.CompletedProcess([], 0, changed + "\n", ""),
-            ]
-        )
-
-        with self.assertRaisesRegex(a8.AcceptanceError, "test-only child"):
-            a8.verify_gonka_test_checkout(Path("gonka"), runner)
-
-    def test_gonka_checkout_rejects_unverified_workflow_change(self):
-        updated_head = "114f914d1d362a3b60ffe13477ef572372fe7c58"
-        changed = "\n".join(
-            [
-                "testermint/src/test/kotlin/MarketplaceContractAcceptanceTests.kt",
-                ".github/workflows/unreviewed.yml",
-            ]
-        )
-        runner = FakeRunner(
-            [
-                subprocess.CompletedProcess([], 0, updated_head + "\n", ""),
-                subprocess.CompletedProcess([], 0, changed + "\n", ""),
-            ]
-        )
-
-        with self.assertRaisesRegex(a8.AcceptanceError, "test-only child"):
-            a8.verify_gonka_test_checkout(Path("gonka"), runner)
-
-    def test_gonka_checkout_rejects_verify_workflow_drift(self):
-        updated_head = "114f914d1d362a3b60ffe13477ef572372fe7c58"
-        runner = FakeRunner(
-            [
-                subprocess.CompletedProcess([], 0, updated_head + "\n", ""),
-                subprocess.CompletedProcess([], 0, ".github/workflows/verify.yml\n", ""),
-                subprocess.CompletedProcess([], 0, "", ""),
-                *self.workflow_blob_results(verify_blob="deadbeef"),
-            ]
-        )
-
-        with self.assertRaisesRegex(a8.AcceptanceError, "P0-preserving manual verify.yml exception"):
-            a8.verify_gonka_test_checkout(Path("gonka"), runner)
-
-    def test_gonka_checkout_rejects_verify_workflow_with_automatic_trigger(self):
-        updated_head = "114f914d1d362a3b60ffe13477ef572372fe7c58"
-        runner = FakeRunner(
-            [
-                subprocess.CompletedProcess([], 0, updated_head + "\n", ""),
-                subprocess.CompletedProcess([], 0, ".github/workflows/verify.yml\n", ""),
-                subprocess.CompletedProcess([], 0, "", ""),
-                *self.workflow_blob_results(verify_blob="2f7a1d1e0b4073791f132e9c3d4318342db5f46e"),
-            ]
-        )
-
-        with self.assertRaisesRegex(a8.AcceptanceError, "mismatched_workflows"):
-            a8.verify_gonka_test_checkout(Path("gonka"), runner)
+    def test_gonka_checkout_rejects_workflow_changes_without_historical_exception(self):
+        base_sha = "1" * 40
+        for workflow_path in (".github/workflows/unreviewed.yml", ".github/workflows/verify.yml"):
+            with self.subTest(workflow_path=workflow_path), tempfile.TemporaryDirectory() as tmp:
+                snap = {
+                    "schema": "a8.source-snapshot/1",
+                    "head": base_sha,
+                    "tree": "2" * 40,
+                    "index_matches_head": True,
+                    "tracked_files": 3,
+                    "tracked_digest": "a" * 64,
+                    "missing_tracked": [],
+                    "status": [f" M {workflow_path}"],
+                    "submodules": [],
+                    "forbidden": [],
+                }
+                with self.assertRaisesRegex(a8.HarnessRefusal, "SOURCE_TREE_DIRTY"):
+                    a8.assert_snapshots_pristine(
+                        Path(tmp),
+                        {"gonka": base_sha},
+                        {"gonka": snap},
+                    )
 
     def test_release_oracle_rejects_conserving_but_wrong_80_20_split(self):
         before = {
@@ -369,6 +645,31 @@ class A8AcceptanceTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(a8.AcceptanceError, "independent oracle"):
             a8.assert_release_matches_oracle(before, wrong_after, 100, 0, 100)
+
+    def test_release_oracle_rejects_ambiguous_policy_variants(self):
+        before = {
+            "gnk_release_policy": {
+                "proportional": {
+                    "buyer_share_numerator": "1",
+                    "share_denominator": "2",
+                },
+                "host_only": {},
+            },
+            "released_total_ngonka": "0",
+            "buyer_released_ngonka": "0",
+            "host_released_ngonka": "0",
+        }
+        with self.assertRaisesRegex(a8.AcceptanceError, "cannot use policy"):
+            a8.expected_release(before, 100)
+        with self.assertRaisesRegex(a8.AcceptanceError, "invalid GNK release policy"):
+            a8.normalize_release_policy(before["gnk_release_policy"])
+        nested = copy.deepcopy(before)
+        nested["gnk_release_policy"].pop("host_only")
+        nested["gnk_release_policy"]["proportional"]["unexpected"] = "1"
+        with self.assertRaisesRegex(a8.AcceptanceError, "cannot use policy"):
+            a8.expected_release(nested, 100)
+        with self.assertRaisesRegex(a8.AcceptanceError, "invalid GNK release policy"):
+            a8.normalize_release_policy(nested["gnk_release_policy"])
 
     def test_release_oracle_uses_cumulative_floor_rounding(self):
         before = {
@@ -490,17 +791,34 @@ class A8AcceptanceTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(a8.AcceptanceError):
                 a8.expected_claim_settlement(context, wrong)
 
-    def test_existing_prod_local_blocks_destructive_testermint_reboot(self):
+    def test_existing_prod_local_inside_snapshot_or_nested_work_root_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
-            checkout = Path(directory)
-            a8.assert_fresh_gonka_local_state(checkout)
-            self.assertTrue((checkout / "prod-local").is_dir())
-            a8.assert_fresh_gonka_local_state(checkout)
-            (checkout / "prod-local" / "chain-state").write_text("occupied")
-            with self.assertRaisesRegex(
-                a8.AcceptanceError, "Testermint deletes this entire ignored path"
-            ):
-                a8.assert_fresh_gonka_local_state(checkout)
+            root = Path(directory)
+            checkout = root / "gonka"
+            checkout.mkdir()
+            work_root = root / "work"
+            a8._assert_outside_snapshots(work_root, [checkout], "work root")
+            with self.assertRaisesRegex(a8.HarnessRefusal, "outside the source snapshots"):
+                a8._assert_outside_snapshots(checkout / "prod-local", [checkout], "work root")
+            base_sha = "1" * 40
+            snap_with_prod_local = {
+                "schema": "a8.source-snapshot/1",
+                "head": base_sha,
+                "tree": "2" * 40,
+                "index_matches_head": True,
+                "tracked_files": 3,
+                "tracked_digest": "a" * 64,
+                "missing_tracked": [],
+                "status": ["!! prod-local/chain-state"],
+                "submodules": [],
+                "forbidden": ["prod-local"],
+            }
+            with self.assertRaisesRegex(a8.HarnessRefusal, "SOURCE_FORBIDDEN_FILE"):
+                a8.assert_snapshots_pristine(
+                    root / "evidence",
+                    {"gonka": base_sha},
+                    {"gonka": snap_with_prod_local},
+                )
 
     def test_deal_terms_must_match_independent_offer_inputs(self):
         expected = {
@@ -1064,6 +1382,8 @@ class A8AcceptanceTests(unittest.TestCase):
                 "run-live",
                 "--gonka-dir",
                 "gonka",
+                "--expected-gonka-sha",
+                "1" * 40,
                 "--scenario",
                 "terminal-release-repeat",
             ]
@@ -1169,7 +1489,12 @@ class A8AcceptanceTests(unittest.TestCase):
 
         error, context = run(valid)
         self.assertIsNone(error)
-        self.assertEqual(context["scenarios"]["case"]["phases"][-1]["name"], "native_bank_release_rollback")
+        fault_phase = context["scenarios"]["case"]["phases"][-1]
+        self.assertEqual(fault_phase["name"], "native_bank_release_rollback")
+        self.assertEqual(
+            fault_phase["expected"]["outgoing_transfer_index_basis"],
+            "release_oracle_expected_position; DeliverTx raw_log proves restriction class, not message index",
+        )
         invalid_cases = (
             ({**valid, "layer": "check_tx"}, "DeliverTx"),
             ({**valid, "tx_hash": ""}, "transaction hash"),
@@ -1194,6 +1519,115 @@ class A8AcceptanceTests(unittest.TestCase):
             ["scenario-release-repeat", "--context", "evidence.json", "--name", "r72"]
         )
         self.assertIs(repeat.handler, a8.scenario_release_repeat)
+
+        early = a8.parser().parse_args(
+            ["assert-early-release-unavailable", "--context", "evidence.json", "--name", "no-sale"]
+        )
+        self.assertIs(early.handler, a8.assert_early_release_unavailable)
+
+    def test_early_release_probe_records_only_included_zero_balance_rejection(self):
+        class NoSaleGonka:
+            def __init__(self):
+                self.host_balance = 100
+                self.buyer_balance = 40
+                self.deal_balance = 0
+
+            def key_address(self, node, key):
+                assert (node, key) == ("buyer-node", "buyer-key")
+                return "buyer"
+
+            def smart(self, *_args):
+                return {"status": "releasing", "buyer": None}
+
+            def cw20_balance(self, _token, address):
+                return {"deal": 0, "host": 0, "fee": 0, "buyer": 0}[address]
+
+            def bank_balance(self, address):
+                return {
+                    "deal": self.deal_balance, "host": self.host_balance,
+                    "fee": 30, "buyer": self.buyer_balance,
+                }[address]
+
+            def tx_attempt(self, node, key, *_args, **_kwargs):
+                assert (node, key) == ("buyer-node", "buyer-key")
+                self.buyer_balance -= 3
+                return {
+                    "layer": "deliver_tx", "tx_hash": "EARLY", "height": "81",
+                    "code": 5, "codespace": "wasm",
+                    "raw_log": "no additional GNK is currently available for release",
+                }
+
+        context = {
+            "chain": {"chain_id": a8.DEFAULT_CHAIN_ID},
+            "contracts": {"foreign_cw20": "foreign"},
+            "accounts": {"buyer": "buyer"},
+            "key_names": {"buyer_node": "buyer-node", "buyer": "buyer-key"},
+            "scenarios": {"no-sale": {
+                "contracts": {"deal": "deal", "cw20": "cw20"},
+                "accounts": {"host": "host", "buyer": None, "fee_recipient": "fee"},
+                "phases": [],
+            }},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.json"
+            path.write_text(json.dumps(context), encoding="utf-8")
+            gonka = NoSaleGonka()
+            with (
+                patch.object(a8, "DockerGonka", return_value=gonka),
+                patch.object(a8, "Runner", lambda: object()),
+                patch.object(a8, "assert_chain"),
+            ):
+                a8.assert_early_release_unavailable(
+                    SimpleNamespace(context=str(path), name="no-sale")
+                )
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            phase = saved["scenarios"]["no-sale"]["phases"][0]
+            self.assertEqual(phase["name"], "early_release_rejected")
+            self.assertEqual(phase["proof"]["contract_error"], "NothingToRelease")
+            self.assertEqual(phase["caller"], "buyer")
+            self.assertEqual(phase["fee_payer_deltas_ngonka"], {"buyer": -3})
+            self.assertEqual(phase["before"]["bank_ngonka"]["deal"], 0)
+            self.assertEqual(phase["after"]["bank_ngonka"]["deal"], 0)
+            gonka.deal_balance = 3
+            with (
+                patch.object(a8, "DockerGonka", return_value=gonka),
+                patch.object(a8, "Runner", lambda: object()),
+                patch.object(a8, "assert_chain"),
+                patch.object(gonka, "tx_attempt") as attempt,
+            ):
+                with self.assertRaisesRegex(a8.AcceptanceError, "no spendable GNK"):
+                    a8.assert_early_release_unavailable(
+                        SimpleNamespace(context=str(path), name="no-sale")
+                    )
+                attempt.assert_not_called()
+
+    def test_scenario_repeat_role_guard_allows_host_only_alias_but_not_proportional_alias(self):
+        scenario = {
+            "accounts": {"host": "same", "buyer": "same", "fee_recipient": "fee"}
+        }
+        context = {"accounts": {"buyer": "buyer"}}
+
+        a8.assert_scenario_repeat_roles(
+            {"gnk_release_policy": "host_only"}, scenario, context, "caller"
+        )
+        with self.assertRaisesRegex(a8.AcceptanceError, "proportional.*independent"):
+            a8.assert_scenario_repeat_roles(
+                {
+                    "gnk_release_policy": {
+                        "proportional": {
+                            "buyer_share_numerator": "1",
+                            "share_denominator": "2",
+                        }
+                    }
+                },
+                scenario,
+                context,
+                "caller",
+            )
+        with self.assertRaisesRegex(a8.AcceptanceError, "caller must be independent"):
+            a8.assert_scenario_repeat_roles(
+                {"gnk_release_policy": "host_only"}, scenario, context, "same"
+            )
 
     def test_bank_fault_selector_uses_buyer_first_for_proportional_and_host_for_host_only(self):
         proportional = {
@@ -1278,7 +1712,48 @@ class A8AcceptanceTests(unittest.TestCase):
         )
         self.assertIs(args.handler, a8.verify_claimed_scenario)
         self.assertTrue(args.require_positive)
-        self.assertEqual(args.wait_seconds, 120)
+        self.assertEqual(args.wait_seconds, 300)
+
+    def test_claim_settle_resume_is_bound_to_prepared_claim_state(self):
+        before = {
+            "deal_state": {"status": "locked"}, "cw20": {"deal": 10},
+            "deal_bank": 0, "vesting": {"total_amount": []},
+        }
+        config = {"target_epoch": 7}
+        summary = {"epochPerformanceSummary": {"epoch_index": "7", "claimed": True}}
+        prepared = {
+            "claim_tx": {"txhash": "ABC", "code": 0},
+            "summary": summary,
+            "before": before,
+            "deal_config": config,
+        }
+        after_claim = {
+            **before, "deal_bank": 25,
+            "vesting": {"total_amount": [{"denom": "ngonka", "amount": "25"}]},
+        }
+        claim_tx, resumed_summary, recorded_before = a8.assert_prepared_claim_resume(
+            prepared, after_claim, config, summary
+        )
+        self.assertEqual(claim_tx["txhash"], "ABC")
+        self.assertEqual(resumed_summary, summary)
+        self.assertEqual(recorded_before, before)
+        with self.assertRaisesRegex(a8.AcceptanceError, "cw20"):
+            a8.assert_prepared_claim_resume(
+                prepared, {**after_claim, "cw20": {"deal": 9}}, config, summary
+            )
+        with self.assertRaisesRegex(a8.AcceptanceError, "native summary"):
+            a8.assert_prepared_claim_resume(prepared, after_claim, config, {})
+
+    def test_claim_settle_modes_are_mutually_exclusive(self):
+        parser = a8.parser()
+        common = [
+            "claim-settle", "--context", "evidence.json",
+            "--reward-seed", "12", "--reward-epoch", "7",
+        ]
+        self.assertTrue(parser.parse_args([*common, "--claim-only"]).claim_only)
+        self.assertTrue(parser.parse_args([*common, "--resume-claim"]).resume_claim)
+        with self.assertRaises(SystemExit):
+            parser.parse_args([*common, "--claim-only", "--resume-claim"])
 
     def test_verify_unclaimed_command_can_require_positive_native_reward(self):
         args = a8.parser().parse_args(
@@ -1331,6 +1806,8 @@ class A8AcceptanceTests(unittest.TestCase):
                 "run-live",
                 "--gonka-dir",
                 "gonka",
+                "--expected-gonka-sha",
+                "1" * 40,
                 "--scenario",
                 "claim-expiry-positive",
             ]
@@ -1344,6 +1821,8 @@ class A8AcceptanceTests(unittest.TestCase):
                 "run-live",
                 "--gonka-dir",
                 "gonka",
+                "--expected-gonka-sha",
+                "1" * 40,
                 "--scenario",
                 "claim-expiry-zero",
             ]
@@ -1357,6 +1836,8 @@ class A8AcceptanceTests(unittest.TestCase):
                 "run-live",
                 "--gonka-dir",
                 "gonka",
+                "--expected-gonka-sha",
+                "1" * 40,
                 "--scenario",
                 "network-unconfirmed",
             ]
@@ -1410,7 +1891,15 @@ class A8AcceptanceTests(unittest.TestCase):
         )
         self.assertIs(command.handler, a8.lock_e_plus_4_scenario)
         live = a8.parser().parse_args(
-            ["run-live", "--gonka-dir", "gonka", "--scenario", "lock-e-plus-4"]
+            [
+                "run-live",
+                "--gonka-dir",
+                "gonka",
+                "--expected-gonka-sha",
+                "1" * 40,
+                "--scenario",
+                "lock-e-plus-4",
+            ]
         )
         self.assertEqual(live.scenario, "lock-e-plus-4")
         rejected = a8.parser().parse_args(
@@ -1419,7 +1908,15 @@ class A8AcceptanceTests(unittest.TestCase):
         self.assertIs(rejected.handler, a8.lock_e_plus_5_rejected_scenario)
         self.assertEqual(rejected.gas, 2_000_000)
         live_e5 = a8.parser().parse_args(
-            ["run-live", "--gonka-dir", "gonka", "--scenario", "lock-e-plus-5"]
+            [
+                "run-live",
+                "--gonka-dir",
+                "gonka",
+                "--expected-gonka-sha",
+                "1" * 40,
+                "--scenario",
+                "lock-e-plus-5",
+            ]
         )
         self.assertEqual(live_e5.scenario, "lock-e-plus-5")
 
@@ -1452,7 +1949,13 @@ class A8AcceptanceTests(unittest.TestCase):
         ])
         self.assertTrue(gift.allow_empty_before)
         live = a8.parser().parse_args([
-            "run-live", "--gonka-dir", "gonka", "--scenario", "package-a-r1-r2"
+            "run-live",
+            "--gonka-dir",
+            "gonka",
+            "--expected-gonka-sha",
+            "1" * 40,
+            "--scenario",
+            "package-a-r1-r2",
         ])
         self.assertEqual(live.scenario, "package-a-r1-r2")
 
@@ -1525,6 +2028,147 @@ class A8AcceptanceTests(unittest.TestCase):
         )
         self.assertTrue(args.require_non_empty)
 
+    def test_vesting_addition_replays_unlock_before_or_after_the_gift_even_in_one_block(self):
+        for unlock_before in (False, True):
+            for same_block in (False, True):
+                with self.subTest(unlock_before=unlock_before, same_block=same_block):
+                    phase = ordered_vesting_addition_phase(unlock_before=unlock_before, same_block=same_block)
+                    count, released = a8.reconcile_vesting_addition(
+                        a8.vesting_epoch_amounts(phase["before"]),
+                        a8.vesting_epoch_amounts(phase["after"]),
+                        phase["addition_by_epoch"],
+                        phase["after_bank_ngonka"] - phase["before_bank_ngonka"],
+                        phase["vesting_events"], phase["recipient"],
+                        phase["proposal"]["proposal"]["messages"][0]["value"]["sender"],
+                    )
+                    self.assertEqual((count, released), (1, phase["released_prefix_ngonka"]))
+
+    def test_vesting_addition_rejects_missing_gift_or_unlock_and_wrong_bank_delta(self):
+        for missing in ("transfer_with_vesting", "unlock_tokens", "bank_delta"):
+            with self.subTest(missing=missing):
+                phase = ordered_vesting_addition_phase(unlock_before=True)
+                events = [event for event in phase["vesting_events"] if event["type"] != missing]
+                delta = 71 if missing == "bank_delta" else 70
+                with self.assertRaisesRegex(a8.AcceptanceError, "cannot be reconciled"):
+                    a8.reconcile_vesting_addition(
+                        a8.vesting_epoch_amounts(phase["before"]),
+                        a8.vesting_epoch_amounts(phase["after"]),
+                        phase["addition_by_epoch"], delta, events, phase["recipient"],
+                        phase["proposal"]["proposal"]["messages"][0]["value"]["sender"],
+                    )
+
+    def test_native_vesting_event_collection_preserves_same_block_order_and_ignores_other_recipients(self):
+        phase = ordered_vesting_addition_phase(unlock_before=True, same_block=True)
+        events = phase["vesting_events"]
+        unrelated = {"type": "transfer", "attributes": []}
+        other = {"type": "transfer_with_vesting", "attributes": [
+            {"key": "recipient", "value": "another-recipient", "index": True}
+        ]}
+        payloads = [
+            {"result": {"finalize_block_events": [
+                *({"type": event["type"], "attributes": event["attributes"]} for event in events),
+                unrelated, other,
+            ]}},
+            {"result": {"finalize_block_events": []}},
+        ]
+        runner = FakeRunner([a8.CommandResult(0, json.dumps(value), "") for value in payloads])
+        collected = a8.vesting_transition_events(a8.DockerGonka(runner), 260, 262, phase["recipient"])
+        self.assertEqual(collected, events)
+
+    def test_vesting_event_collection_rejects_missing_block_results(self):
+        runner = FakeRunner([a8.CommandResult(0, json.dumps({}), "")])
+        with self.assertRaisesRegex(a8.AcceptanceError, "lack result"):
+            a8.vesting_transition_events(a8.DockerGonka(runner), 40, 41, "deal")
+
+    def test_recorded_ordered_vesting_evidence_passes_offline_verification_after_an_old_tranche_unlocks(self):
+        for unlock_before in (False, True):
+            with self.subTest(unlock_before=unlock_before), tempfile.TemporaryDirectory() as directory:
+                phase = ordered_vesting_addition_phase(unlock_before=unlock_before)
+                chain = real_lock_exact_e_context()["chain"]
+                chain["status"]["sync_info"]["latest_block_height"] = str(phase["after_height"])
+                snapshot = {
+                    "name": "vesting_snapshot", "label": "before-gift",
+                    "schedule": phase["before"], "height": phase["before_height"],
+                    "epoch": phase["before_epoch"], "bank_balance_ngonka": phase["before_bank_ngonka"],
+                }
+                context = {"chain": chain, "scenarios": {"gift": {
+                    "contracts": {"deal": phase["recipient"]}, "phases": [snapshot],
+                }}}
+                path = Path(directory) / "context.json"
+                a8.write_object(path, context)
+                responses = [
+                    chain["status"], phase["after"], {"epoch": phase["after_epoch"]},
+                    {"balance": {"denom": "ngonka", "amount": str(phase["after_bank_ngonka"])}},
+                    *({"result": {"finalize_block_events": [
+                        {"type": event["type"], "attributes": event["attributes"]}
+                    ]}} for event in phase["vesting_events"]),
+                    phase["proposal"], phase["funding_tx"],
+                ]
+                runner = FakeRunner([a8.CommandResult(0, json.dumps(value), "") for value in responses])
+                args = SimpleNamespace(
+                    context=str(path), name="gift", before_label="before-gift", amount=11,
+                    vesting_epochs=2, allow_empty_before=False, proposal_id=phase["proposal_id"],
+                    fund_tx_hash=phase["funding_tx"]["tx_hash"],
+                )
+                with patch.object(a8, "Runner", return_value=runner):
+                    a8.verify_vesting_addition_scenario(args)
+                produced = a8.load_object(path)["scenarios"]["gift"]["phases"][-1]
+                self.assertTrue(_validate_vesting_addition(produced))
+                self.assertEqual(produced["released_prefix_ngonka"], phase["released_prefix_ngonka"])
+                self.assertFalse(runner.results)
+
+    def test_vesting_producer_rejects_mismatched_governance_or_funding_answer(self):
+        """Queried governance and funding records must match. All fixtures are synthetic. No network, Docker, or live chain calls."""
+        for field, value, error in (
+            ("status", "PROPOSAL_STATUS_NOT_PASSED", "proposal did not pass"),
+            ("id", "2", "proposal ID does not match"),
+            ("funding_hash", "F" * 64, "funding transaction hash does not match"),
+            ("funding_recipient", "gonka1unrelatedrecipient", "expected one exact Bank transfer event"),
+            ("funding_amount", "1ngonka", "expected one exact Bank transfer event"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                phase = ordered_vesting_addition_phase(unlock_before=True)
+                chain = real_lock_exact_e_context()["chain"]
+                chain["status"]["sync_info"]["latest_block_height"] = str(phase["after_height"])
+                proposal = copy.deepcopy(phase["proposal"])
+                funding_tx = copy.deepcopy(phase["funding_tx"])
+                if field == "funding_hash":
+                    funding_tx["tx_hash"] = value
+                elif field in ("funding_recipient", "funding_amount"):
+                    key = field.removeprefix("funding_")
+                    transfer = next(event for event in funding_tx["events"] if event["type"] == "transfer")
+                    next(attr for attr in transfer["attributes"] if attr["key"] == key)["value"] = value
+                else:
+                    proposal["proposal"][field] = value
+                responses = [
+                    chain["status"], phase["after"], {"epoch": phase["after_epoch"]},
+                    {"balance": {"denom": "ngonka", "amount": str(phase["after_bank_ngonka"])}},
+                    *({"result": {"finalize_block_events": [
+                        {"type": event["type"], "attributes": event["attributes"]}
+                    ]}} for event in phase["vesting_events"]),
+                    proposal, funding_tx,
+                ]
+                runner = FakeRunner([a8.CommandResult(0, json.dumps(item), "") for item in responses])
+                context = {"chain": chain, "scenarios": {"gift": {
+                    "contracts": {"deal": phase["recipient"]},
+                    "phases": [{
+                        "name": "vesting_snapshot", "label": "before-gift",
+                        "schedule": phase["before"], "height": phase["before_height"],
+                        "epoch": phase["before_epoch"],
+                        "bank_balance_ngonka": phase["before_bank_ngonka"],
+                    }],
+                }}}
+                path = Path(directory) / "context.json"
+                a8.write_object(path, context)
+                args = SimpleNamespace(
+                    context=str(path), name="gift", before_label="before-gift", amount=11,
+                    vesting_epochs=2, allow_empty_before=False, proposal_id=phase["proposal_id"],
+                    fund_tx_hash=phase["funding_tx"]["tx_hash"],
+                )
+                with patch.object(a8, "Runner", return_value=runner):
+                    with self.assertRaisesRegex(a8.AcceptanceError, error):
+                        a8.verify_vesting_addition_scenario(args)
+
     def test_create_key_never_exposes_mnemonic_in_error(self):
         secret = "word " * 24
         runner = FakeRunner([a8.CommandResult(0, json.dumps({"mnemonic": secret}), "")])
@@ -1535,21 +2179,16 @@ class A8AcceptanceTests(unittest.TestCase):
     def test_context_write_is_atomic_and_round_trips_unicode(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "evidence.json"
-            value = {"kind": "тест", "phases": []}
+            value = {"kind": "С‚РµСЃС‚", "phases": []}
             a8.write_object(path, value)
             self.assertEqual(a8.load_object(path), value)
             self.assertFalse(path.with_suffix(".json.tmp").exists())
 
-    @unittest.skipUnless(a8.os.name == "nt", "Windows-specific path conversion")
-    def test_windows_path_is_converted_without_shell_parsing(self):
-        converted = a8.wsl_path(Path("C:/work/gonka"), FakeRunner([]))
-        self.assertEqual(converted.lower(), "/mnt/c/work/gonka")
-
-    @unittest.skipIf(a8.os.name == "nt", "POSIX-specific path passthrough")
-    def test_posix_path_is_resolved_without_wsl_conversion(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "gonka"
-            self.assertEqual(a8.wsl_path(path, FakeRunner([])), str(path.resolve()))
+    def test_wsl_path_and_windows_runtime_helpers_are_removed(self):
+        self.assertFalse(hasattr(a8, "wsl_path"))
+        self.assertFalse(hasattr(a8, "require_exact_sha"))
+        self.assertFalse(hasattr(a8, "EXPECTED_GONKA_SHA"))
+        self.assertFalse(hasattr(a8, "EXPECTED_GONKA_BASE_SHA"))
 
     def test_p0_probe_command_requires_context_and_wasm(self):
         args = a8.parser().parse_args(
@@ -1558,6 +2197,116 @@ class A8AcceptanceTests(unittest.TestCase):
         self.assertIs(args.handler, a8.p0_probe)
         self.assertEqual(args.context, "evidence.json")
         self.assertEqual(args.wasm, "probe.wasm")
+
+    def test_p0_probe_exercises_allowed_queries_and_requires_the_broad_route_to_be_denied(self):
+        class ProbeGonka:
+            def __init__(self, denied):
+                self.denied = denied
+                self.stored = None
+                self.smart_calls = []
+                self.cli_call = None
+
+            def store(self, path, label):
+                self.stored = (path, label)
+                return "17", {"sha256": "a" * 64}
+
+            def instantiate(self, code_id, message, label):
+                self.asserted_code_id = code_id
+                return "gonka1probe", {"address": "gonka1probe"}
+
+            def smart(self, contract, message):
+                self.smart_calls.append((contract, message))
+                return {next(iter(message)): {"ok": True}}
+
+            def cli(self, container, *args):
+                self.cli_call = (container, args)
+                return self.denied
+
+        context = {
+            "chain": {"chain_id": "gonka-test"},
+            "run_id": "fixture-run",
+            "terms": {"target_epoch": 5},
+            "accounts": {"host": "gonka1host"},
+            "contracts": {"deal": "gonka1deal"},
+        }
+        runner = ProbeGonka(
+            a8.CommandResult(
+                1,
+                "",
+                "'/inference.inference.Query/Params' path is not allowed from the contract",
+            )
+        )
+        phases = []
+        args = SimpleNamespace(context="unused-context.json", wasm="probe.wasm")
+        with patch.object(a8, "load_object", return_value=context), patch.object(
+            a8, "DockerGonka", return_value=runner
+        ), patch.object(a8, "assert_chain"), patch.object(
+            a8, "append_phase", side_effect=lambda _path, phase: phases.append(phase)
+        ):
+            a8.p0_probe(args)
+
+        self.assertEqual(runner.stored, (Path("probe.wasm"), "p0-probe"))
+        self.assertEqual(runner.asserted_code_id, "17")
+        self.assertEqual(len(runner.smart_calls), 4)
+        self.assertEqual(
+            [next(iter(message)) for _, message in runner.smart_calls],
+            ["get_current_epoch", "list_claim_recipients", "epoch_performance_summary", "total_vesting"],
+        )
+        self.assertEqual(runner.cli_call[1][:4], ("query", "wasm", "contract-state", "smart"))
+        self.assertEqual(len(phases), 1)
+        self.assertEqual(phases[0]["name"], "p0_wasm_grpc_allowlist")
+        self.assertEqual(phases[0]["denied_query"]["path"], "/inference.inference.Query/Params")
+        self.assertIn(
+            "path is not allowed from the contract",
+            phases[0]["denied_query"]["error"],
+        )
+
+    def test_p0_probe_rejects_a_permitted_or_unclassified_broad_route_failure(self):
+        context = {
+            "chain": {"chain_id": "gonka-test"},
+            "run_id": "fixture-run",
+            "terms": {"target_epoch": 5},
+            "accounts": {"host": "gonka1host"},
+            "contracts": {"deal": "gonka1deal"},
+        }
+
+        class ProbeGonka:
+            def store(self, _path, _label):
+                return "17", {}
+
+            def instantiate(self, _code_id, _message, _label):
+                return "gonka1probe", {}
+
+            def smart(self, _contract, message):
+                return {next(iter(message)): {}}
+
+            def cli(self, _container, *_args):
+                return self.denied
+
+        args = SimpleNamespace(context="unused-context.json", wasm="probe.wasm")
+        for denied, expected_error in (
+            (a8.CommandResult(0, "{}", ""), "unexpectedly allowed"),
+            (
+                a8.CommandResult(
+                    1,
+                    "",
+                    "query failed while requesting /inference.inference.Query/Params",
+                ),
+                "without the expected allowlist denial",
+            ),
+            (
+                a8.CommandResult(1, "", "permission denied"),
+                "without the expected allowlist denial",
+            ),
+        ):
+            with self.subTest(stderr=denied.stderr):
+                runner = ProbeGonka()
+                runner.denied = denied
+                with patch.object(a8, "load_object", return_value=context), patch.object(
+                    a8, "DockerGonka", return_value=runner
+                ), patch.object(a8, "assert_chain"), patch.object(a8, "append_phase"):
+                    with self.assertRaisesRegex(a8.AcceptanceError, expected_error):
+                        a8.p0_probe(args)
 
     def test_b3_release_command_requires_explicit_native_fixture_inputs(self):
         args = a8.parser().parse_args(
@@ -1573,90 +2322,57 @@ class A8AcceptanceTests(unittest.TestCase):
         self.assertIs(args.handler, a8.b3_foreign_native_release)
         self.assertEqual(args.foreign_amount, 12345)
 
-    def test_gonka_overlay_checksum_verification_passes(self):
-        a8.verify_gonka_overlay_integrity(a8.DEFAULT_GONKA_OVERLAY_DIR)
+    def test_assert_snapshots_pristine_accepts_exact_expected_sha(self):
+        selected_base_sha = "1" * 40
+        snap = {
+            "schema": "a8.source-snapshot/1",
+            "head": selected_base_sha,
+            "tree": "2" * 40,
+            "index_matches_head": True,
+            "tracked_files": 3,
+            "tracked_digest": "a" * 64,
+            "missing_tracked": [],
+            "status": [],
+            "submodules": [],
+            "forbidden": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            a8.assert_snapshots_pristine(
+                Path(tmp),
+                {"gonka": selected_base_sha},
+                {"gonka": snap},
+            )
+            self.assertFalse(hasattr(a8, "verify_gonka_test_checkout"))
 
-    def test_gonka_overlay_checksum_fails_on_tamper(self):
-        with tempfile.TemporaryDirectory() as td:
-            temp_overlay = Path(td) / "overlay"
-            import shutil
-            shutil.copytree(a8.DEFAULT_GONKA_OVERLAY_DIR, temp_overlay)
-            tampered_file = temp_overlay / "README_SMART_CONTRACT_TEST.md"
-            tampered_file.write_text("tampered content", encoding="utf-8")
-            with self.assertRaisesRegex(a8.AcceptanceError, "Overlay checksum mismatch"):
-                a8.verify_gonka_overlay_integrity(temp_overlay)
-
-    def test_gonka_overlay_checksum_fails_if_checksums_file_missing(self):
-        with tempfile.TemporaryDirectory() as td:
-            temp_overlay = Path(td) / "overlay"
-            import shutil
-            shutil.copytree(a8.DEFAULT_GONKA_OVERLAY_DIR, temp_overlay)
-            (temp_overlay / "CHECKSUMS.sha256").unlink()
-            with self.assertRaisesRegex(a8.AcceptanceError, "checksum manifest missing"):
-                a8.verify_gonka_overlay_integrity(temp_overlay)
-
-    def test_apply_gonka_overlay_copies_expected_files(self):
-        with tempfile.TemporaryDirectory() as td:
-            target = Path(td) / "target"
-            target.mkdir()
-            count = a8.apply_gonka_overlay(a8.DEFAULT_GONKA_OVERLAY_DIR, target)
-            self.assertEqual(count, 35)
-            self.assertTrue((target / "inference-chain/app/legacy.go").is_file())
-            self.assertTrue((target / "inference-chain/scripts/init-docker-genesis.sh").is_file())
-            if a8.os.name != "nt":
-                mode = (target / "inference-chain/scripts/init-docker-genesis.sh").stat().st_mode
-                self.assertTrue(bool(mode & 0o111))
-
-    def test_verify_gonka_test_checkout_accepts_expected_base_sha(self):
-        runner = FakeRunner([subprocess.CompletedProcess([], 0, a8.EXPECTED_GONKA_BASE_SHA + "\n", "")])
-        self.assertEqual(
-            a8.verify_gonka_test_checkout(Path("gonka"), runner),
-            a8.EXPECTED_GONKA_BASE_SHA,
-        )
-
-    def test_parser_supports_overlay_and_temporary_workspace_flags(self):
+    def test_parser_run_live_accepts_immutable_work_root_and_rejects_legacy_overlay_and_temp_gonka_flags(self):
         parsed = a8.parser().parse_args(
             [
                 "run-live",
                 "--gonka-dir", "base-gonka",
-                "--overlay-dir", "custom-overlay",
-                "--temp-gonka-dir", "tmp-ws",
-                "--keep-temp-gonka",
-                "--no-temp-gonka",
+                "--expected-gonka-sha", "1" * 40,
+                "--work-root", "work-root",
+                "--testermint-harness-dir", "external-harness",
+                "--scenario", "lock-exact-e",
             ]
         )
         self.assertEqual(parsed.gonka_dir, "base-gonka")
-        self.assertEqual(parsed.overlay_dir, "custom-overlay")
-        self.assertEqual(parsed.temp_gonka_dir, "tmp-ws")
-        self.assertTrue(parsed.keep_temp_gonka)
-        self.assertTrue(parsed.no_temp_gonka)
+        self.assertEqual(parsed.expected_gonka_sha, "1" * 40)
+        self.assertEqual(parsed.work_root, "work-root")
+        self.assertEqual(parsed.testermint_harness_dir, "external-harness")
+        self.assertEqual(parsed.scenario, "lock-exact-e")
+        for legacy_argv in (
+            ["run-live", "--gonka-dir", "base-gonka", "--expected-gonka-sha", "1" * 40, "--overlay-dir", "custom-overlay"],
+            ["run-live", "--gonka-dir", "base-gonka", "--expected-gonka-sha", "1" * 40, "--no-temp-gonka"],
+            ["run-live", "--gonka-dir", "base-gonka", "--expected-gonka-sha", "1" * 40, "--temp-gonka-dir", "tmp-ws"],
+            ["run-live", "--gonka-dir", "base-gonka", "--expected-gonka-sha", "1" * 40, "--keep-temp-gonka"],
+            ["run-live", "--gonka-dir", "base-gonka", "--expected-gonka-sha", "1" * 40, "--scenario", "full"],
+            ["run-live", "--gonka-dir", "base-gonka", "--scenario", "lock-exact-e"],
+        ):
+            with self.subTest(legacy_argv=legacy_argv):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        a8.parser().parse_args(legacy_argv)
 
-    def test_prepare_temporary_gonka_workspace_with_fake_runner(self):
-        with tempfile.TemporaryDirectory() as td:
-            base_dir = Path(td) / "base-gonka"
-            base_dir.mkdir()
-            target_dir = Path(td) / "temp-ws"
-            fake_results = [
-                subprocess.CompletedProcess([], 0, a8.EXPECTED_GONKA_BASE_SHA + "\n", ""),  # rev-parse HEAD
-                subprocess.CompletedProcess([], 0, "", ""),  # clone -s
-                subprocess.CompletedProcess([], 0, "", ""),  # checkout
-                subprocess.CompletedProcess([], 0, a8.EXPECTED_GONKA_BASE_SHA + "\n", ""),  # pinned HEAD
-                subprocess.CompletedProcess([], 0, "", ""),  # config user.name
-                subprocess.CompletedProcess([], 0, "", ""),  # config user.email
-                subprocess.CompletedProcess([], 0, "", ""),  # add -A
-                subprocess.CompletedProcess([], 0, "", ""),  # commit
-            ]
-            runner = FakeRunner(fake_results)
-            ws, cleanup = a8.prepare_temporary_gonka_workspace(
-                base_dir,
-                a8.DEFAULT_GONKA_OVERLAY_DIR,
-                runner,
-                target_dir=target_dir,
-            )
-            self.assertEqual(ws, target_dir.resolve())
-            self.assertIsNone(cleanup)
-            self.assertTrue((ws / "inference-chain/app/legacy.go").is_file())
-            self.assertEqual(len(runner.calls), 8)
 
 
 class WithdrawalKeeperTests(unittest.TestCase):

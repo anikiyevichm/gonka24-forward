@@ -908,6 +908,51 @@ fn event_attribute<'a>(response: &'a AppResponse, event_type: &str, key: &str) -
         .map(|attribute| attribute.value.as_str())
 }
 
+// Keep both outage scenarios subject to the same rollback checks. The macro
+// accepts the concrete cw-multi-test app without duplicating its generic type.
+macro_rules! assert_hidden_claim_preserves_state_and_balances {
+    ($app:ident, $token:ident, $deal:ident, $buyer:ident, $host:ident, $fees:ident) => {{
+        let before: deal::StateResponse = $app
+            .wrap()
+            .query_wasm_smart(&$deal, &deal::QueryMsg::State {})
+            .unwrap();
+        let balances = [
+            cw20_balance!($app, $token, $deal),
+            cw20_balance!($app, $token, $buyer),
+            cw20_balance!($app, $token, $host),
+            cw20_balance!($app, $token, $fees),
+        ];
+        for msg in [
+            deal::ExecuteMsg::SettleClaim {},
+            deal::ExecuteMsg::Refund {},
+        ] {
+            let error = $app
+                .execute_contract("caller".into_addr(), $deal.clone(), &msg, &[])
+                .unwrap_err();
+            assert_eq!(
+                error.root_cause().to_string(),
+                "Gonka query failed for /inference.inference.Query/EpochPerformanceSummaryByParticipant"
+            );
+            assert_eq!(
+                $app.wrap()
+                    .query_wasm_smart::<deal::StateResponse>(&$deal, &deal::QueryMsg::State {})
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                [
+                    cw20_balance!($app, $token, $deal),
+                    cw20_balance!($app, $token, $buyer),
+                    cw20_balance!($app, $token, $host),
+                    cw20_balance!($app, $token, $fees),
+                ],
+                balances
+            );
+        }
+        (before, balances)
+    }};
+}
+
 macro_rules! withdraw_all_usdt {
     ($app:ident, $deal:ident) => {{
         let pending: deal::UsdtPaymentsResponse = $app
@@ -4048,7 +4093,7 @@ fn claim_expiry_fails_closed_at_e_plus_one_for_claimed_and_invalid_evidence() {
 }
 
 #[test]
-fn network_unconfirmed_refund_rolls_back_retries_and_keeps_terminal_host_only_economics() {
+fn c_network_unconfirmed_refund_rolls_back_retries_and_keeps_terminal_host_only_economics() {
     let (mut app, native, token, factory_addr, deal_addr, controller, host, buyer, fees) = settlement_fixture!(
         true,
         true,
@@ -4060,7 +4105,6 @@ fn network_unconfirmed_refund_rolls_back_retries_and_keeps_terminal_host_only_ec
     );
     {
         let mut state = native.lock().unwrap();
-        state.current_epoch = 14;
         // The native claim may really have happened; the query failure hides
         // that fact from the contract at the moment Refund executes.
         state.performance_summary = Some(EpochPerformanceSummary {
@@ -4073,6 +4117,23 @@ fn network_unconfirmed_refund_rolls_back_retries_and_keeps_terminal_host_only_ec
         });
         state.performance_response = FundingQueryResponse::QueryFailure;
     }
+
+    // The same hidden claimed summary must not release a deposit at E+2.
+    native.lock().unwrap().current_epoch = 13;
+    assert!(
+        native
+            .lock()
+            .unwrap()
+            .performance_summary
+            .as_ref()
+            .unwrap()
+            .claimed
+    );
+    println!("C_CASE:r5-cancel-native"); // modeled claim only, not native ledger proof
+    assert_hidden_claim_preserves_state_and_balances!(app, token, deal_addr, buyer, host, fees);
+    println!("C_CASE:r5-cancel-probe");
+    println!("C_CASE:r5-cancel-e2");
+    native.lock().unwrap().current_epoch = 14;
 
     let donation = Uint128::new(7_000_000);
     app.execute_contract(
@@ -4231,6 +4292,15 @@ fn network_unconfirmed_refund_rolls_back_retries_and_keeps_terminal_host_only_ec
         )
         .unwrap();
     assert_eq!(indexed.address, deal_addr.to_string());
+    for case in [
+        "r6.3",
+        "r5-cancel-e3",
+        "r5-cancel-ledger",
+        "r5-cancel-terminal-refund",
+        "r5-cancel-terminal-settle_claim",
+    ] {
+        println!("C_CASE:{case}");
+    }
 }
 
 #[test]
@@ -5704,4 +5774,150 @@ fn rejected_native_and_cw20_funding_preserve_sender_balances() {
         .unwrap();
     assert_eq!(owner_balance.balance, Uint128::new(STARTING_CW20));
     assert_eq!(deal_balance.balance, Uint128::zero());
+}
+
+#[test]
+fn c_recovery_before_deadline_preserves_ledgers_and_settles_once() {
+    for settlement_epoch in [13, 14] {
+        let (mut app, native, token, _, deal_addr, _, host, buyer, fees) = settlement_fixture!(
+            false,
+            true,
+            FUNDING_BUDGET,
+            1_000_000,
+            "host",
+            "buyer",
+            "fees"
+        );
+        set_native_performance(&native, 11, host.to_string(), 60_000_000_000, 0, true);
+        native.lock().unwrap().current_epoch = 13;
+        native.lock().unwrap().performance_response = FundingQueryResponse::QueryFailure;
+        assert!(
+            native
+                .lock()
+                .unwrap()
+                .performance_summary
+                .as_ref()
+                .unwrap()
+                .claimed
+        );
+        let (before, balances) = assert_hidden_claim_preserves_state_and_balances!(
+            app, token, deal_addr, buyer, host, fees
+        );
+        native.lock().unwrap().performance_response = FundingQueryResponse::Valid; // restored strictly before E+3
+        assert!(
+            native
+                .lock()
+                .unwrap()
+                .performance_summary
+                .as_ref()
+                .unwrap()
+                .claimed
+        );
+        // Exercise the recovered query before the deadline as well as at E+3.
+        // Each iteration uses a fresh deal so settlement remains a one-time action.
+        native.lock().unwrap().current_epoch = settlement_epoch;
+        let error = app
+            .execute_contract(
+                "caller".into_addr(),
+                deal_addr.clone(),
+                &deal::ExecuteMsg::Refund {},
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.root_cause().to_string(),
+            "native claim for target epoch 11 is already confirmed"
+        );
+        assert_eq!(
+            app.wrap()
+                .query_wasm_smart::<deal::StateResponse>(&deal_addr, &deal::QueryMsg::State {})
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            [
+                cw20_balance!(app, token, deal_addr),
+                cw20_balance!(app, token, buyer),
+                cw20_balance!(app, token, host),
+                cw20_balance!(app, token, fees)
+            ],
+            balances
+        );
+        app.execute_contract(
+            "caller".into_addr(),
+            deal_addr.clone(),
+            &deal::ExecuteMsg::SettleClaim {},
+            &[],
+        )
+        .unwrap();
+        let after: deal::StateResponse = app
+            .wrap()
+            .query_wasm_smart(&deal_addr, &deal::QueryMsg::State {})
+            .unwrap();
+        assert_eq!(after.status, deal::DealStatus::Releasing);
+        // 60 GNK at 1 USDT/GNK, with a 1.5% fee, leaves 40 USDT unspent.
+        assert_eq!(after.buyer_refund_usdt, Uint128::new(40_000_000));
+        assert_eq!(after.host_net_usdt, Uint128::new(59_100_000));
+        assert_eq!(after.fee_usdt, Uint128::new(900_000));
+        assert_eq!(
+            [
+                cw20_balance!(app, token, deal_addr),
+                cw20_balance!(app, token, buyer),
+                cw20_balance!(app, token, host),
+                cw20_balance!(app, token, fees)
+            ],
+            balances,
+            "settlement records obligations without paying any role prematurely"
+        );
+        withdraw_all_usdt!(app, deal_addr);
+        let paid = [
+            cw20_balance!(app, token, deal_addr),
+            cw20_balance!(app, token, buyer),
+            cw20_balance!(app, token, host),
+            cw20_balance!(app, token, fees),
+        ];
+        assert_eq!(paid[0], Uint128::zero());
+        assert_eq!(paid[1] - balances[1], after.buyer_refund_usdt);
+        assert_eq!(paid[2] - balances[2], after.host_net_usdt);
+        assert_eq!(paid[3] - balances[3], after.fee_usdt);
+        assert_eq!(
+            after.buyer_refund_usdt + after.host_net_usdt + after.fee_usdt,
+            Uint128::new(FUNDING_BUDGET)
+        );
+        let error = app
+            .execute_contract(
+                "repeat".into_addr(),
+                deal_addr.clone(),
+                &deal::ExecuteMsg::SettleClaim {},
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.root_cause().to_string(),
+            "cannot settle claim in state Releasing; expected Locked"
+        );
+        assert_eq!(
+            app.wrap()
+                .query_wasm_smart::<deal::StateResponse>(&deal_addr, &deal::QueryMsg::State {})
+                .unwrap(),
+            after
+        );
+        assert_eq!(
+            [
+                cw20_balance!(app, token, deal_addr),
+                cw20_balance!(app, token, buyer),
+                cw20_balance!(app, token, host),
+                cw20_balance!(app, token, fees)
+            ],
+            paid
+        );
+    }
+    // Emit each coverage marker once, after both boundary cases pass. Native
+    // and ledger markers cover only the modeled claimed summary and CW20
+    // balances, not preservation of a native claim or vesting ledger.
+    for suffix in [
+        "native", "probe", "e2", "ledger", "refund", "settle", "repeat",
+    ] {
+        println!("C_CASE:r5-recover-{suffix}");
+    }
 }

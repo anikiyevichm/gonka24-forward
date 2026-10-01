@@ -8,9 +8,27 @@ Licensor holds the necessary rights. It does not replace third-party terms.
   [provenance](packages/gonka-proto/proto/PROVENANCE.toml) identify the sources.
 - `packages/gonka-proto/src/generated/` contains generated bindings derived from
   that snapshot. Generation does not remove applicable upstream terms.
-- Upstream portions of `gonka-overlay/` retain their source terms. The pinned
-  Gonka license is reproduced in [licenses/Gonka-pinned.txt](licenses/Gonka-pinned.txt)
-  from commit `379bebced638aeb5e6077bfd51c986f898443832`.
+- Upstream-derived A8 harness material must be tracked to its individual source
+  revision. `A8UpstreamTestSupport.kt` identifies its verbatim helper source as
+  Gonka commit `c33c9eaa5bc40c53b564159b5e1534bbfdab8a08`,
+  `testermint/src/test/kotlin/DevshardTestSupport.kt` lines 340–364. The genesis
+  provisioner identifies the source sequence and its SHA-256 in its header;
+  both refer to `inference-chain/scripts/init-docker-genesis.sh` at that same
+  commit. At that commit, GitHub reports `LICENSE.md` blob
+  `c65ef755460ee6fedad9669216df820f5c0e29ed` (14,883 bytes), and the complete
+  recursive tree contains no separate Appendix A or Genesis Code Reference
+  file. The license text defines Genesis Code by that reference but the pinned
+  source tree does not expose its file list; the verbatim Kotlin helper has no
+  per-file license header. The Go boundary fixtures are project-authored test
+  support and must not be treated as verbatim upstream code without separate
+  evidence.
+  `licenses/Gonka-pinned.txt` is the copy of `LICENSE.md` recorded for Gonka
+  commit `379bebced638aeb5e6077bfd51c986f898443832` in the protobuf provenance;
+  that pin alone does not establish the license text or file-specific scope at
+  `c33c9eaa5bc40c53b564159b5e1534bbfdab8a08`. Verify the license at each source
+  revision and confirm which files are designated as Genesis Code before
+  release. Until that scope is confirmed, do not claim that this copy of the
+  license conclusively covers every derived harness file.
 - Apache-2.0 terms are reproduced in [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt).
   The vendored Google protobuf and GoGo files retain their complete BSD notices
   in their source headers. Preserve the applicable notices in redistributed

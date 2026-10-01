@@ -465,20 +465,26 @@ and late donations were distributed according to frozen shares. Four Marketplace
 gRPC routes are accessible from Wasm; broad routes are prohibited. Exact tx/state/balance
 evidence is recorded in [A8/B acceptance report](reviews/a8-b-acceptance-report.md).
 
-Reproducible runs require a clean Marketplace checkout and a clean base Gonka checkout.
-All required Gonka test harness files, gRPC query allowlist, and fault injection components
-are maintained on our side under `gonka-overlay/`.
+Reproducible runs require a clean Marketplace checkout and a clean Gonka checkout
+at the selected commit. **The Gonka checkout is never modified**: the Marketplace
+Kotlin scenarios, Compose fragments, the B3 genesis provisioner, the API container
+controller and the Go/Wasm probes live on our side under `ops/a8/harness/`.
 
-When executing `a8_acceptance.py run-live`, the runner automatically:
-1. Clones/copies the base Gonka checkout to an isolated temporary workspace directory.
-2. Injects all required test files from `gonka-overlay/` onto that temporary copy and creates a local commit.
-3. Compiles contracts from `gonka24-smart-contract` and executes Docker/Gradle suites against the temporary workspace.
-4. Cleans up the temporary copy upon completion, keeping the host Gonka repository completely untouched and pristine.
+When executing `a8_acceptance.py run-live`, the harness:
+1. Verifies that both checkouts are exactly their selected commits (HEAD, tree, tracked bytes, submodules, no added or ignored files).
+2. Checks that every upstream Testermint API the scenarios need exists, before creating any network.
+3. Builds the selected Gonka's unmodified Testermint and the external harness out-of-tree under `--work-root`, and prepares a separate network work directory (`GONKA_REPO_ROOT`) with byte-identical copies of the upstream network resources.
+4. Runs the selected scenario, collects JUnit and logs from the external project, and re-verifies both checkouts; any change fails the run (`source-immutability.json`).
+
+In practice run it through the E2E runner (`ops/e2e/run-e2e.sh`); see
+[`ops/e2e/RUNBOOK-immutable-sources.md`](../ops/e2e/RUNBOOK-immutable-sources.md).
+The direct invocation below is kept for reference:
 
 ```powershell
 git clone https://github.com/gonka-ai/gonka.git ..\gonka-clean
 python scripts/a8_acceptance.py run-live `
   --gonka-dir ..\gonka-clean `
+  --expected-gonka-sha <GONKA_FULL_40_HEX_SHA> `
   --manifest artifacts/a9-local/build-manifest.json `
   --run-id a8-funded-local --timeout-minutes 60
 ```
@@ -525,7 +531,13 @@ Minimum real-chain scenarios and expected outcomes:
 13. Verify running `wasmd`/`wasmvm` versions and remediation of all applicable
     advisories, including CWA-2025-007.
 
-Open dependencies: Optional B2 typed absence enhancement, B3 gas/pruning bounds,
-B4 claimed atomicity/native gas traces and updating `wasmd v0.54.2` due to CWA-2025-007,
-remaining B5 matrix, B6 keeper operations, and production parameters. While open,
+Optional follow-up: the B2 typed-absence enhancement. It is not itself a production
+gate. Production gates still open are B3 gas/pruning bounds; B4 claimed atomicity
+and native gas traces; the remaining B5 matrix; B6 keeper operations; and validated
+production parameters. The pinned target uses `wasmd v0.54.2`, which is affected
+by [CWA-2025-007](https://github.com/CosmWasm/advisories/blob/main/CWAs/CWA-2025-007.md);
+the advisory lists `v0.54.3` as patched and says the fix requires a coordinated,
+consensus-breaking chain upgrade. Verify the actual Gonka runtime and its upgrade
+before production; changing only the contract repository's dependency declaration
+does not remediate the running chain. While any mandatory gate remains open,
 full A8/MVP is not production-ready.

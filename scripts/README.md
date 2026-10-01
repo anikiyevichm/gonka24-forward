@@ -61,31 +61,47 @@ python -m unittest discover -s scripts/tests -p 'test_*.py' -v
 These fixtures validate parsing, fail-closed assertions, and retry policies of our
 tooling. They do not prove compatibility with a live running fork of Gonka.
 
-## A8: Live Testermint Acceptance & Decoupled Gonka Overlay
+## A8: Live Testermint Acceptance against an unmodified Gonka
 
-Smart contract acceptance tests require specific Gonka query allowlists, Docker Compose overlays, and Testermint acceptance tests. **These test components are maintained on our side in `gonka-overlay/` rather than in the core Gonka blockchain repository.**
+The Gonka checkout is **never modified**. There is no `gonka-overlay/` any more:
+the Marketplace Kotlin scenarios live in the external Gradle project
+[`ops/a8/harness/testermint`](../ops/a8/harness/testermint/README.md), Compose
+fragments and the B3 genesis provisioner in `ops/a8/harness/network`, the API
+container controller in `ops/a8/harness/container_control.py`, and the Go/Wasm
+probes in `ops/a8/harness/go-boundary` and `ops/a8/harness/wasm-probe`.
 
-When starting `a8_acceptance.py run-live`, the runner:
-1. Takes a clean base Gonka repository checkout (`--gonka-dir`), pinned to `EXPECTED_GONKA_BASE_SHA` (`379bebced638aeb5e6077bfd51c986f898443832`).
-2. Dynamically provisions an isolated temporary copy (`--temp-gonka-dir` or an automatic temporary directory).
-3. Overlays all required files from `gonka-overlay/` onto the temporary copy and commits them so the temporary environment is completely clean.
-4. Compiles contracts from `gonka24-smart-contract` and executes Docker / Gradle tests against the temporary Gonka workspace.
-5. Automatically cleans up the temporary workspace on run completion (use `--keep-temp-gonka` to preserve it for diagnostics).
-
-Your base host Gonka repository remains completely pristine and unmodified.
+Live acceptance execution is supported **exclusively inside the Linux Docker runner container** via [`ops/e2e/run-e2e.sh`](../ops/e2e/run-e2e.sh) (Linux/macOS) or [`ops/e2e/Run-E2E.ps1`](../ops/e2e/Run-E2E.ps1) (Windows) against two explicitly selected full 40-hex commit SHAs (`--gonka-sha` and `--contracts-sha`). Direct host execution and `wsl.exe` bridging are not supported.
 
 ```bash
-python3 scripts/a8_acceptance.py run-live \
-  --gonka-dir /path/to/clean/base-gonka \
-  --manifest artifacts/a9-local/build-manifest.json \
-  --run-id a8-funded-local --timeout-minutes 60
+./ops/e2e/run-e2e.sh run \
+  --gonka-repo https://github.com/gonka-ai/gonka \
+  --gonka-sha <GONKA_FULL_40_HEX_SHA> \
+  --contracts-path . \
+  --contracts-sha <CONTRACTS_FULL_40_HEX_SHA> \
+  --scenario funded-claim \
+  --output ./out/e2e
 ```
 
-Additional runner arguments:
-- `--overlay-dir <path>`: Override the overlay source directory (defaults to `gonka-overlay/`).
-- `--temp-gonka-dir <path>`: Specify an explicit directory for the temporary workspace copy.
-- `--keep-temp-gonka`: Preserve the temporary Gonka workspace after test completion.
-- `--no-temp-gonka`: Legacy mode to run directly in `--gonka-dir` without creating a temporary copy.
+Inside the runner container, `ops/a8` materialises both commits from Git
+objects and invokes `scripts/a8_acceptance.py run-live` with mandatory
+provenance expectations:
+- `--expected-gonka-sha <sha>`: the selected Gonka commit. The snapshot must be exactly this commit (HEAD, tree, tracked bytes, submodules, no added or ignored files) before and after the Testermint run, and the running binary must report it.
+- `--expected-marketplace-sha <sha>`: the selected contracts commit, checked the same way.
+- `--work-root <dir>`: outside both snapshots; holds Gradle state, the out-of-tree upstream Testermint build, the harness build and the network work directory (`GONKA_REPO_ROOT`).
+- `--testermint-harness-dir <dir>`: the runner's external Kotlin harness.
+- `--expected-proto-sha <sha>`: Independent contract ABI/protobuf compatibility pin (`EXPECTED_PROTO_SHA`), never derived from the selected Gonka runtime SHA.
+
+`run-live` fails before creating any network when a required upstream Testermint
+API is missing (`TESTERMINT_API_MISSING`), fails when the selected JUnit test did
+not run (`SELECTED_TEST_NOT_EXECUTED`), and fails when either snapshot changed
+(`source-immutability.json` verdict other than `UNCHANGED`).
+
+`build-external-harness --gonka-dir DIR --work-root DIR` performs only the
+snapshot check, the API check, the out-of-tree upstream Testermint build and the
+harness compilation — no chain or inner Docker daemon. It may download Gradle
+dependencies, and the documented invocation runs inside the runner container.
+It is step 2 of
+[`ops/e2e/RUNBOOK-immutable-sources.md`](../ops/e2e/RUNBOOK-immutable-sources.md).
 
 During settlement, an independent oracle evaluates native performance summary and submitted offer terms rather than economic fields from Deal state. It independently calculates Work/Reward, Buyer/Host GNK shares, gross, fee, Host net, Buyer refund, and expected CW20 deltas. During release, another oracle calculates cumulative Buyer/Host shares. Mere conservation of sums is insufficient and is not accepted as PASS.
 
