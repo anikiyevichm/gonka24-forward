@@ -1,3 +1,8 @@
+"""Offline A9 release tooling tests.
+
+All fixtures are synthetic. No external network, Docker, or live chain calls; HTTP is loopback-only.
+"""
+
 from __future__ import annotations
 
 import base64
@@ -6,7 +11,9 @@ import copy
 import importlib.util
 import io
 import json
+import os
 import sys
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -168,6 +175,81 @@ def preflight_with_fake_network(config: dict, manifest: dict, manifest_path: Pat
     )
 
 
+class ArchiveExtractionTests(unittest.TestCase):
+    def test_internal_symlink_chains_are_preserved_but_an_escaping_target_is_rejected_in_either_order(self):
+        for reverse in (False, True):
+            for escaping in (False, True):
+                with self.subTest(reverse=reverse, escaping=escaping), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    destination = root / "source"
+                    destination.mkdir()
+                    # Git archives store symlinks as SYMTYPE members. The negative
+                    # differs only in the target of the second link.
+                    links = [("d/b", ".."), ("escape", "d/b/.." if escaping else "d/b/scripts")]
+                    if reverse:
+                        links.reverse()
+                    archive = io.BytesIO()
+                    with tarfile.open(fileobj=archive, mode="w") as output:
+                        member = tarfile.TarInfo("scripts/run.sh")
+                        payload = b"#!/bin/sh\necho safe\n"
+                        member.mode = 0o755
+                        member.size = len(payload)
+                        output.addfile(member, io.BytesIO(payload))
+                        for name, target in links:
+                            member = tarfile.TarInfo(name)
+                            member.type = tarfile.SYMTYPE
+                            member.mode = 0o777
+                            member.linkname = target
+                            output.addfile(member)
+                    archive.seek(0)
+                    with tarfile.open(fileobj=archive) as source:
+                        if escaping:
+                            with self.assertRaisesRegex(a9.ToolError, "unsafe symlink target"):
+                                a9.safe_extract_tar(source, destination)
+                            self.assertFalse((destination / "escape").is_symlink())
+                            self.assertFalse((destination / "d/b").is_symlink())
+                        else:
+                            a9.safe_extract_tar(source, destination)
+                            self.assertEqual((destination / "escape/run.sh").read_bytes(), payload)
+
+    def test_safe_extraction_is_compatible_with_python_311_and_preserves_executable_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "source.tar"
+            payload = b"#!/bin/sh\necho safe\n"
+            with tarfile.open(archive, "w") as output:
+                member = tarfile.TarInfo("scripts/run.sh")
+                member.size = len(payload)
+                member.mode = 0o755
+                output.addfile(member, io.BytesIO(payload))
+
+            destination = root / "destination"
+            destination.mkdir()
+            with tarfile.open(archive) as source:
+                a9.safe_extract_tar(source, destination)
+
+            extracted = destination / "scripts" / "run.sh"
+            self.assertEqual(extracted.read_bytes(), payload)
+            if os.name == "posix":
+                self.assertEqual(extracted.stat().st_mode & 0o777, 0o755)
+
+    def test_safe_extraction_rejects_a_symlink_that_escapes_the_archive_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "unsafe.tar"
+            with tarfile.open(archive, "w") as output:
+                member = tarfile.TarInfo("links/outside")
+                member.type = tarfile.SYMTYPE
+                member.linkname = "../../outside"
+                output.addfile(member)
+
+            destination = root / "destination"
+            destination.mkdir()
+            with tarfile.open(archive) as source:
+                with self.assertRaisesRegex(a9.ToolError, "unsafe symlink target"):
+                    a9.safe_extract_tar(source, destination)
+
+
 class FakeChainRunner:
     def __init__(self, manifest, config, receipt):
         self.manifest = manifest
@@ -274,6 +356,88 @@ class QueueRunner:
         if isinstance(value, BaseException):
             raise value
         return value
+
+
+class OptimizerDnsRetryTests(unittest.TestCase):
+    def test_optimizer_selects_the_toolchain_already_pinned_in_the_image(self):
+        command = a9.optimizer_docker_command(
+            Path("/release/build-1/source"), "optimizer@sha256:digest"
+        )
+        self.assertIn(
+            "RUSTUP_TOOLCHAIN=1.81.0-x86_64-unknown-linux-musl", command
+        )
+        self.assertEqual(command.count("-e"), 1)
+        self.assertEqual(command[-1], "optimizer@sha256:digest")
+
+    def test_transient_rustup_dns_failures_are_bounded_and_then_succeed(self):
+        failures = [
+            a9.CommandResult(
+                1,
+                "",
+                "could not download https://static.rust-lang.org/dist/channel: "
+                "dns error: failed to lookup address information",
+            ),
+            a9.CommandResult(
+                1,
+                "",
+                "could not download https://static.rust-lang.org/dist/channel: "
+                "failed to lookup address information",
+            ),
+        ]
+        runner = QueueRunner([*failures, a9.CommandResult(0, "built")])
+        delays = []
+
+        result, attempts = a9.run_optimizer_checked(
+            runner, ["docker", "run", "optimizer"], sleep=delays.append
+        )
+
+        self.assertEqual(result.stdout, "built")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(delays, [5.0, 15.0])
+
+    def test_crates_index_dns_failure_uses_the_same_bounded_retry(self):
+        runner = QueueRunner(
+            [
+                a9.CommandResult(
+                    1,
+                    "",
+                    "failed to download https://index.crates.io/config.json: "
+                    "Couldn't resolve host: index.crates.io",
+                ),
+                a9.CommandResult(0, "built"),
+            ]
+        )
+        delays = []
+
+        _result, attempts = a9.run_optimizer_checked(
+            runner, ["docker", "run", "optimizer"], sleep=delays.append
+        )
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(delays, [5.0])
+
+    def test_a_non_dns_optimizer_failure_is_never_retried(self):
+        runner = QueueRunner([a9.CommandResult(1, "", "error: could not compile crate")])
+        with self.assertRaisesRegex(a9.ToolError, "could not compile crate"):
+            a9.run_optimizer_checked(
+                runner, ["docker", "run", "optimizer"], sleep=self.fail
+            )
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_repeated_dns_failure_still_fails_closed_after_four_attempts(self):
+        failure = a9.CommandResult(
+            1,
+            "",
+            "https://static.rust-lang.org: dns error: failed to lookup address",
+        )
+        runner = QueueRunner([failure, failure, failure, failure])
+        delays = []
+        with self.assertRaisesRegex(a9.ToolError, "static.rust-lang.org"):
+            a9.run_optimizer_checked(
+                runner, ["docker", "run", "optimizer"], sleep=delays.append
+            )
+        self.assertEqual(len(runner.calls), 4)
+        self.assertEqual(delays, [5.0, 15.0, 30.0])
 
 
 class A9ReleaseTests(unittest.TestCase):

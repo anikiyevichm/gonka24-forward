@@ -12,8 +12,10 @@ import argparse
 import base64
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,13 +26,194 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
-EXPECTED_GONKA_BASE_SHA = "379bebced638aeb5e6077bfd51c986f898443832"
-EXPECTED_GONKA_SHA = "29a58fcf64b87967cb874b6169ce2c61e1f269b1"
 EXPECTED_PROTO_SHA = "379bebced638aeb5e6077bfd51c986f898443832"
 EXPECTED_WASMD_VERSION = "v0.54.2"
 EXPECTED_WASMVM_VERSION = "v2.2.4"
 DEFAULT_CHAIN_ID = "gonka-mainnet"
-DEFAULT_GONKA_OVERLAY_DIR = Path(__file__).resolve().parents[1] / "gonka-overlay"
+
+#: This very file. Every re-entry into the harness - Testermint's bootstrap and
+#: each scenario phase - must run this script, which belongs to the runner image
+#: and is pinned by the run lock. Deriving it from the checkout under test would
+#: let the code being judged supply its own judge.
+HARNESS_SCRIPT_PATH = Path(__file__).resolve()
+
+#: The external-harness runtime (API check, network root, out-of-tree Gradle,
+#: JUnit and B3 genesis evidence). A sibling file of this harness, loaded by
+#: path because the ``ops`` package is not importable where this script runs.
+EXTERNAL_HARNESS_PATH = HARNESS_SCRIPT_PATH.with_name("a8_external_harness.py")
+
+
+def _load_external_harness():
+    name = "a8_external_harness"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, EXTERNAL_HARNESS_PATH)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise SystemExit(f"cannot load {EXTERNAL_HARNESS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+external_harness = _load_external_harness()
+
+# ---------------------------------------------------------------------------
+# Parameterised provenance expectations
+# ---------------------------------------------------------------------------
+# The E2E runner selects explicit Gonka and contracts commits in the run plan,
+# and the harness proves that both source snapshots are *exactly* those commits
+# before and after the run (``ops/a8/source_snapshot.py``). There is no
+# "prepared" commit and no list of paths allowed to differ any more: a changed,
+# added or deleted file is a violation, never an allow-listed patch.
+#
+# The channel is the environment as well as CLI flags because the harness is
+# re-entered by Testermint (``bootstrap`` runs inside the Kotlin test), where
+# forwarding new flags is not possible. Every variable below is recorded in the
+# E2E run lock as a semantic input, so a replay cannot be re-parameterised from
+# a different shell without producing a different plan.
+ENV_EXPECTED_GONKA_SHA = "A8_EXPECTED_GONKA_SHA"
+ENV_EXPECTED_PROTO_SHA = "A8_EXPECTED_PROTO_SHA"
+ENV_EXPECTED_RUNTIME = "A8_EXPECTED_RUNTIME"
+ENV_EVIDENCE_MODEL = "A8_EVIDENCE_MODEL"
+
+#: Variables of the removed overlay / prepared-tree model. They are refused, not
+#: ignored: a caller still setting them is asking for a tree that differs from
+#: the selected commit, which the immutable-source model never grants.
+LEGACY_OVERLAY_ENVIRONMENT = (
+    "A8_EXPECTED_GONKA_PREPARED_SHA",
+    "A8_EXPECTED_GONKA_BASE_SHA",
+    "A8_ALLOWED_TEST_PATHS",
+)
+
+# ---------------------------------------------------------------------------
+# Evidence model declaration
+# ---------------------------------------------------------------------------
+# The same document shape (`live-context.json`, schema 1.0.0) has been produced
+# under three sets of rules. A consumer that guesses grades one of them by the
+# wrong rules, so the producer states the model it followed.
+#
+# These literals are duplicated from ``ops/a8/evidence_model.py`` and
+# ``ops/a8/e2e/context.py`` on purpose: this script is executed standalone
+# inside the runner image and by Testermint, where the ``ops`` package is not
+# importable. The duplication is pinned by a test that asserts the strings are
+# equal in all places.
+#
+# Only EVIDENCE_MODEL_IMMUTABLE may be declared by a new run. The other two are
+# recognised so historical packages keep their original classification; they
+# are never re-labelled as immutable-source proof.
+EVIDENCE_MODEL_LEGACY = "a8.evidence/legacy-overlay/1"
+EVIDENCE_MODEL_E2E = "a8.evidence/e2e-prepared-build/1"
+EVIDENCE_MODEL_IMMUTABLE = "a8.evidence/e2e-immutable-source/2"
+HISTORICAL_EVIDENCE_MODELS = (EVIDENCE_MODEL_LEGACY, EVIDENCE_MODEL_E2E)
+KNOWN_EVIDENCE_MODELS = (*HISTORICAL_EVIDENCE_MODELS, EVIDENCE_MODEL_IMMUTABLE)
+
+_FULL_SHA_CHARS = set("0123456789abcdef")
+
+
+def _env_sha(name: str, default: str | None = None) -> str:
+    value = (os.environ.get(name) or "").strip().lower()
+    if not value:
+        if default is not None:
+            return default
+        raise AcceptanceError(
+            f"{name} is required by the active E2E plan; missing or empty value"
+        )
+    if len(value) != 40 or not set(value).issubset(_FULL_SHA_CHARS):
+        raise SystemExit(
+            f"{name} must be a full 40-hex commit SHA; got {value!r}"
+        )
+    return value
+
+
+def expected_gonka_sha() -> str:
+    """The upstream Gonka commit selected by the active E2E plan."""
+    return _env_sha(ENV_EXPECTED_GONKA_SHA)
+
+
+def expected_proto_sha() -> str:
+    """Reference ABI/protobuf SHA.
+
+    Deliberately *not* derived from the selected Gonka commit. It describes the
+    format compatibility the contracts were built against, which is a different
+    claim from "this binary is running". The E2E runner never rewrites it
+    automatically; changing it is an explicit decision.
+    """
+    return _env_sha(ENV_EXPECTED_PROTO_SHA, EXPECTED_PROTO_SHA)
+
+
+def _refuse_evidence_model(value: str, source: str) -> str:
+    if value in HISTORICAL_EVIDENCE_MODELS:
+        raise SystemExit(
+            f"{source} cannot declare historical evidence model {value!r}; new runs "
+            f"produce only {EVIDENCE_MODEL_IMMUTABLE!r}. Create a new plan."
+        )
+    if value != EVIDENCE_MODEL_IMMUTABLE:
+        raise SystemExit(
+            f"{source} must be {EVIDENCE_MODEL_IMMUTABLE!r}; got {value!r}"
+        )
+    return value
+
+
+def evidence_model() -> str:
+    """Which set of rules the evidence this run writes was produced under.
+
+    Unset defaults to EVIDENCE_MODEL_IMMUTABLE. A historical (overlay or
+    prepared-build) declaration or an unknown model is refused.
+    """
+    value = (os.environ.get(ENV_EVIDENCE_MODEL) or "").strip()
+    if not value:
+        return EVIDENCE_MODEL_IMMUTABLE
+    return _refuse_evidence_model(value, ENV_EVIDENCE_MODEL)
+
+
+def refuse_legacy_overlay_environment() -> None:
+    """Fail when a caller still speaks the removed overlay/prepared-tree model."""
+    present = sorted(name for name in LEGACY_OVERLAY_ENVIRONMENT if (os.environ.get(name) or "").strip())
+    if present:
+        raise AcceptanceError(
+            "overlay/prepared-tree provenance was removed; refusing a run that sets "
+            + ", ".join(present)
+            + ". The Gonka snapshot must be exactly the selected commit"
+        )
+
+
+def expected_runtime_versions() -> dict[str, str]:
+    """Expected ``inferenced version --long`` fields.
+
+    Requires an explicit Gonka commit expectation from the active E2E plan (no
+    historical SHA fallback). An E2E plan overrides ``wasmd`` / ``wasmvm`` and
+    ``gonka_source_sha`` with values measured from the selected sources.
+    """
+    raw = os.environ.get(ENV_EXPECTED_RUNTIME) or ""
+    overrides: dict[str, str] = {}
+    for chunk in raw.replace("\n", ",").split(","):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        key, _, value = item.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            overrides[key] = value
+    if "gonka_source_sha" in overrides:
+        runtime_sha = overrides["gonka_source_sha"].lower()
+        if len(runtime_sha) != 40 or not set(runtime_sha).issubset(_FULL_SHA_CHARS):
+            raise AcceptanceError(
+                f"expected runtime gonka_source_sha must be a full 40-hex SHA; got {runtime_sha!r}"
+            )
+        overrides["gonka_source_sha"] = runtime_sha
+    else:
+        runtime_sha = expected_gonka_sha()
+    expected = {
+        "gonka_source_sha": runtime_sha,
+        "wasmd": EXPECTED_WASMD_VERSION,
+        "wasmvm": EXPECTED_WASMVM_VERSION,
+    }
+    expected.update(overrides)
+    return expected
+
+
 TEST_CW20_SYMBOL = "AUSDT"
 DEFAULT_DENOM = "ngonka"
 DEFAULT_NODE = "genesis-node"
@@ -135,11 +318,9 @@ def parse_runtime_identity(version_output: str) -> dict[str, str]:
             fields["go"] = stripped.partition(":")[2].strip()
         elif stripped.startswith("cosmos_sdk_version:"):
             fields["cosmos_sdk"] = stripped.partition(":")[2].strip()
-    expected = {
-        "gonka_source_sha": EXPECTED_GONKA_SHA,
-        "wasmd": EXPECTED_WASMD_VERSION,
-        "wasmvm": EXPECTED_WASMVM_VERSION,
-    }
+    # The E2E plan supplies the source SHA and measured dependency versions;
+    # only dependency versions retain reviewed defaults. Mismatches are fatal.
+    expected = expected_runtime_versions()
     mismatches = {
         key: {"expected": value, "actual": fields.get(key)}
         for key, value in expected.items()
@@ -372,7 +553,12 @@ def cw20_settlement_fault_targets(
 def normalize_release_policy(value: Any) -> str | dict[str, dict[str, int]]:
     if value == "host_only":
         return "host_only"
-    if isinstance(value, Mapping) and isinstance(value.get("proportional"), Mapping):
+    if (
+        isinstance(value, Mapping)
+        and set(value) == {"proportional"}
+        and isinstance(value["proportional"], Mapping)
+        and set(value["proportional"]) == {"buyer_share_numerator", "share_denominator"}
+    ):
         proportional = value["proportional"]
         return {
             "proportional": {
@@ -415,23 +601,6 @@ def assert_deal_terms(
         )
 
 
-def assert_fresh_gonka_local_state(gonka_dir: Path) -> None:
-    prod_local = gonka_dir.resolve() / "prod-local"
-    if os.path.lexists(prod_local):
-        if prod_local.is_dir() and not any(prod_local.iterdir()):
-            return
-        raise AcceptanceError(
-            "refusing destructive Testermint reboot because Gonka prod-local already "
-            f"exists: {prod_local}. Testermint deletes this entire ignored path; use "
-            "a fresh checkout or preserve/remove it explicitly outside the harness"
-        )
-    # Create the bind root from the launching host before crossing into WSL.
-    # Docker Desktop's DrvFs/9p bind can retain a deleted name as simultaneously
-    # existing for mkdir and absent for lookup. A host-created empty root avoids
-    # that inconsistent first mkdir; DockerGroup still owns child cleanup/setup.
-    prod_local.mkdir()
-
-
 def expected_release(before_state: Mapping[str, Any], available: int) -> dict[str, int]:
     if available < 0:
         raise AcceptanceError("release oracle received a negative available balance")
@@ -441,7 +610,12 @@ def expected_release(before_state: Mapping[str, Any], available: int) -> dict[st
     policy = before_state.get("gnk_release_policy")
     if policy == "host_only":
         numerator, denominator = 0, 1
-    elif isinstance(policy, dict) and isinstance(policy.get("proportional"), dict):
+    elif (
+        isinstance(policy, dict)
+        and set(policy) == {"proportional"}
+        and isinstance(policy["proportional"], dict)
+        and set(policy["proportional"]) == {"buyer_share_numerator", "share_denominator"}
+    ):
         proportional = policy["proportional"]
         numerator = int(proportional["buyer_share_numerator"])
         denominator = int(proportional["share_denominator"])
@@ -771,14 +945,19 @@ def assert_no_bank_transfer_involving(value: Mapping[str, Any], address: str) ->
             continue
         attributes = event.get("attributes")
         if not isinstance(attributes, list):
-            continue
-        endpoints = {
-            attribute.get("value")
-            for attribute in attributes
-            if isinstance(attribute, dict)
-            and attribute.get("key") in {"sender", "recipient"}
-        }
-        if address in endpoints:
+            raise AcceptanceError("Bank transfer event has malformed attributes")
+        fields: dict[str, str] = {}
+        for attribute in attributes:
+            if not isinstance(attribute, dict):
+                raise AcceptanceError("Bank transfer event has malformed attributes")
+            key = attribute.get("key")
+            value = attribute.get("value")
+            if not isinstance(key, str) or not isinstance(value, str) or key in fields:
+                raise AcceptanceError("Bank transfer event has malformed attributes")
+            fields[key] = value
+        if not fields.get("sender") or not fields.get("recipient"):
+            raise AcceptanceError("Bank transfer event omits a sender or recipient")
+        if address in (fields["sender"], fields["recipient"]):
             raise AcceptanceError("transaction emitted a Bank transfer involving Deal")
 
 
@@ -980,6 +1159,23 @@ class DockerGonka:
         return parse_object(
             self.cli(DEFAULT_NODE, "status", "--output", "json"), "node status"
         )
+
+    def block_results(self, height: int) -> dict[str, Any]:
+        """Read consensus events for one exact height from the local node RPC."""
+        if height <= 0:
+            raise AcceptanceError(f"block-results height must be positive, got {height}")
+        result = self.runner.run(
+            [
+                "docker",
+                "exec",
+                DEFAULT_NODE,
+                "wget",
+                "-qO-",
+                f"http://127.0.0.1:26657/block_results?height={height}",
+            ],
+            timeout=30,
+        )
+        return parse_object(result, f"block results at height {height}")
 
     def binary_version(self) -> str:
         result = self.cli(DEFAULT_NODE, "version", "--long", timeout=30)
@@ -1285,8 +1481,9 @@ class DockerGonka:
         nested = value.get("data")
         return nested if isinstance(nested, dict) else value
 
-    def bank_balance(self, address: str, denom: str = DEFAULT_DENOM) -> int:
-        value = self.query_json("bank", "balance", address, denom)
+    def bank_balance(self, address: str, denom: str = DEFAULT_DENOM, *, height: int | None = None) -> int:
+        flags = ("--height", str(height)) if height is not None else ()
+        value = self.query_json("bank", "balance", address, denom, *flags)
         balance = value.get("balance")
         if not isinstance(balance, dict):
             raise AcceptanceError(f"bank balance response missing balance: {value}")
@@ -1312,298 +1509,6 @@ class DockerGonka:
     def cw20_balance(self, contract: str, address: str) -> int:
         value = self.smart(contract, {"balance": {"address": address}})
         return int(value["balance"])
-
-
-def require_exact_sha(gonka_dir: Path) -> None:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=gonka_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 or result.stdout.strip() != EXPECTED_GONKA_SHA:
-        raise AcceptanceError(
-            f"Gonka checkout must be exact {EXPECTED_GONKA_SHA}, got {result.stdout.strip()!r}"
-        )
-
-
-def wsl_path(path: Path, runner: Runner) -> str:
-    del runner
-    resolved = path.resolve()
-    if os.name != "nt":
-        return str(resolved)
-    drive = resolved.drive.removesuffix(":").lower()
-    if len(drive) != 1 or not drive.isalpha():
-        raise AcceptanceError(f"cannot convert non-drive path for WSL: {resolved}")
-    tail = resolved.as_posix()[2:].lstrip("/")
-    return f"/mnt/{drive}/{tail}"
-
-
-PR4_MANUAL_WORKFLOWS_SHA = "f4a8b8ab10b106e68bd80c1e176f276b8989859e"
-
-B3_HARNESS_GONKA_PATHS = {
-    "local-test-net/docker-compose.a8-query-faults.yml",
-    "docs/a8-preparation/package-a.md",
-    "docs/a8-preparation/package-b.md",
-    "docs/a8-preparation/runtime-faults.md",
-    "testermint/src/test/kotlin/A8PackageBBankFaultPlan.kt",
-    "testermint/src/test/kotlin/A8PackageBBankFaultPlanTests.kt",
-    "inference-chain/app/a8_query_fault_selector_test.go",
-    "inference-chain/app/a8_faults_disabled_test.go",
-    "inference-chain/app/a8_faults_enabled_test.go",
-    "inference-chain/app/a8faults/plan_test.go",
-
-    "inference-chain/scripts/init-docker-genesis.sh",
-    "local-test-net/docker-compose.genesis-a8-b3-foreign-denom.yml",
-    "testermint/src/main/kotlin/DockerGroup.kt",
-    "testermint/src/main/kotlin/LocalInferencePair.kt",
-    "testermint/src/test/kotlin/DockerBindUserArgsTests.kt",
-    "testermint/src/test/kotlin/MarketplaceContractAcceptanceTests.kt",
-    "testermint/src/test/kotlin/MarketplaceHarnessProcess.kt",
-    "testermint/src/test/kotlin/MarketplaceHarnessProcessTests.kt",
-    "testermint/src/test/resources/a8-b3-genesis-validation-overrides.json",
-}
-
-# Exact reviewed blobs: the default build is a no-op; only a8faults installs
-# the bounded test provider. Any later runtime edit requires explicit repinning.
-A8_RUNTIME_ADAPTER_BLOBS = {
-    "inference-chain/app/legacy.go": "a2949596a4eb21c0380c32b7b27c6050eca461d1",
-    "inference-chain/app/a8_faults_disabled.go": "9e482887299cc86be720001c2dae51ab24851181",
-    "inference-chain/app/a8_faults_enabled.go": "6cea27971df79d9a3348b537fa91c18b6178e425",
-    "inference-chain/app/a8faults/plan.go": "19aabed256279a6ad6a098ac2483fd7e4115911f",
-    "inference-chain/cmd/a8-query-fault-plan/main.go": "ffca66051acb97c393c1f45481e2fb556780bc33",
-}
-
-PR4_MANUAL_WORKFLOW_PATHS = {
-    ".github/workflows/build-upgrades.yml",
-    ".github/workflows/devshard-testenv.yml",
-    ".github/workflows/dont_panic.yml",
-    ".github/workflows/integration.yml",
-    ".github/workflows/publish_upgrade_binaries.yml",
-    ".github/workflows/release.yml",
-    ".github/workflows/sanity.yml",
-    ".github/workflows/testermint-upgrade-rehearsal.yml",
-    ".github/workflows/update_voting.yml",
-    ".github/workflows/verify-proto-go-generation.yml",
-    ".github/workflows/verify.yml",
-}
-
-# These are Git blob IDs, not a broad allowance for `.github`.  PR #4 is the
-# reviewed source for the manual-only workflows.  `verify.yml` is exceptional:
-# the pinned runtime already contained the P0 fixture job, so its approved
-# result is that pinned content with *only* the triggers changed to
-# workflow_dispatch (blob 1293e8...).
-PR4_MANUAL_WORKFLOW_BLOBS = {
-    ".github/workflows/build-upgrades.yml": "5f8316f32abeede05128a932f25243b6d78272c6",
-    ".github/workflows/devshard-testenv.yml": "10e60e08be71deac8720354626edb512ab34cd8d",
-    ".github/workflows/dont_panic.yml": "3c386c943557159b211c54915a643055f538506b",
-    ".github/workflows/integration.yml": "a27cfde56b68457bdd1b217edb0e1f1d530cbe36",
-    ".github/workflows/publish_upgrade_binaries.yml": "72caf719b170132228de55b9c226eb4d54ac3670",
-    ".github/workflows/release.yml": "09b5b2d887fa4f529d8187d566ac5c0db64a6f29",
-    ".github/workflows/sanity.yml": "ef626505348883119648c72693719dd90c1ecf74",
-    ".github/workflows/testermint-upgrade-rehearsal.yml": "255bf9698e6529350f10cec026ca6aa2d3add1ca",
-    ".github/workflows/update_voting.yml": "1d2eaa50838324855c1583fdd0c5e427156f367c",
-    ".github/workflows/verify-proto-go-generation.yml": "07261ed074bac119ab1cb0af97724793b5d32cb0",
-    ".github/workflows/verify.yml": "1293e8b533c87cdd6208e20205c822b546b9327b",
-}
-
-OVERLAY_ADDITIONAL_GONKA_PATHS = {
-    "README_SMART_CONTRACT_TEST.md",
-    "inference-chain/app/legacy_test.go",
-    "inference-chain/app/wasm_grpc_query_allowlist_test.go",
-    "inference-chain/contracts/p0-probe/Cargo.lock",
-    "inference-chain/contracts/p0-probe/Cargo.toml",
-    "inference-chain/contracts/p0-probe/Makefile",
-    "inference-chain/contracts/p0-probe/README.md",
-    "inference-chain/contracts/p0-probe/artifacts/checksums.txt",
-    "inference-chain/contracts/p0-probe/artifacts/p0_probe.wasm",
-    "inference-chain/contracts/p0-probe/build.sh",
-    "inference-chain/contracts/p0-probe/src/contract.rs",
-    "inference-chain/contracts/p0-probe/src/lib.rs",
-    "inference-chain/contracts/p0-probe/src/msg.rs",
-    "inference-chain/contracts/p0-probe/src/proto.rs",
-}
-
-
-def verify_gonka_overlay_integrity(overlay_dir: Path) -> dict[str, str]:
-    checksum_file = overlay_dir / "CHECKSUMS.sha256"
-    if not checksum_file.is_file():
-        raise AcceptanceError(f"Overlay checksum manifest missing: {checksum_file}")
-    entries: dict[str, str] = {}
-    for line in checksum_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(maxsplit=1)
-        if len(parts) != 2:
-            raise AcceptanceError("Malformed overlay checksum entry")
-        digest, rel = parts
-        if (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
-                or "\\" in rel or ":" in rel or rel.startswith("/")
-                or any(part in ("", ".", "..", ".git") for part in rel.split("/"))
-                or rel in ("CHECKSUMS.sha256", "README.md") or rel in entries):
-            raise AcceptanceError(f"Invalid or duplicate overlay checksum entry: {rel}")
-        entries[rel] = digest
-    if not entries:
-        raise AcceptanceError("Empty overlay checksum manifest")
-    actual_files = set()
-    for path in overlay_dir.rglob("*"):
-        if path.is_symlink():
-            raise AcceptanceError(f"Overlay symlink is forbidden: {path}")
-        if path.is_file():
-            rel = path.relative_to(overlay_dir).as_posix()
-            if rel not in ("CHECKSUMS.sha256", "README.md"):
-                actual_files.add(rel)
-    if actual_files != set(entries):
-        raise AcceptanceError("Overlay file inventory differs from checksum manifest")
-    for rel, digest in entries.items():
-        if sha256_file(overlay_dir / rel) != digest:
-            raise AcceptanceError(f"Overlay checksum mismatch for {rel}")
-    return entries
-
-
-def apply_gonka_overlay(overlay_dir: Path, target_dir: Path) -> int:
-    entries = verify_gonka_overlay_integrity(overlay_dir)
-    for rel, digest in sorted(entries.items()):
-        dst_file = target_dir / rel
-        if not dst_file.resolve().is_relative_to(target_dir.resolve()):
-            raise AcceptanceError(f"Overlay destination escapes workspace: {rel}")
-        dst_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(overlay_dir / rel, dst_file)
-        if sha256_file(dst_file) != digest:
-            raise AcceptanceError(f"Copied overlay checksum mismatch: {rel}")
-        if dst_file.suffix == ".sh" or dst_file.name == "gradlew":
-            dst_file.chmod(0o755)
-    return len(entries)
-
-
-def prepare_temporary_gonka_workspace(
-    base_gonka_dir: Path,
-    overlay_dir: Path,
-    runner: Runner,
-    target_dir: Path | None = None,
-    base_sha: str = EXPECTED_GONKA_BASE_SHA,
-    keep_temp: bool = False,
-) -> tuple[Path, Any]:
-    verify_gonka_overlay_integrity(overlay_dir)
-    base_gonka_dir = base_gonka_dir.resolve()
-    if not base_gonka_dir.is_dir():
-        raise AcceptanceError(f"Base Gonka directory does not exist: {base_gonka_dir}")
-
-    rev = runner.run(["git", "-c", "safe.bareRepository=all", "-C", str(base_gonka_dir), "rev-parse", "HEAD"], timeout=30)
-    if rev.returncode != 0:
-        raise AcceptanceError(
-            rev.stderr.strip() or f"Cannot resolve git HEAD for base Gonka directory: {base_gonka_dir}"
-        )
-    base_head = rev.stdout.strip()
-
-    cleanup_obj = None
-    if target_dir is None and keep_temp:
-        workspace = Path(tempfile.mkdtemp(prefix="gonka-a8-workspace-")).resolve()
-    elif target_dir is None:
-        cleanup_obj = tempfile.TemporaryDirectory(prefix="gonka-a8-workspace-")
-        workspace = Path(cleanup_obj.name).resolve()
-    else:
-        workspace = target_dir.resolve()
-        workspace.mkdir(parents=True, exist_ok=True)
-
-    def checked(command: list[str], timeout: int) -> subprocess.CompletedProcess:
-        result = runner.run(command, timeout=timeout)
-        if result.returncode != 0:
-            raise AcceptanceError(result.stderr.strip() or f"Workspace preparation failed: {command}")
-        return result
-
-    try:
-        checked(["git", "-c", "safe.bareRepository=all", "clone", "-s",
-                 str(base_gonka_dir), str(workspace)], 180)
-        checked(["git", "-C", str(workspace), "checkout", "--detach", base_sha], 60)
-        actual = checked(["git", "-C", str(workspace), "rev-parse", "HEAD"], 30)
-        if actual.stdout.strip() != base_sha:
-            raise AcceptanceError("Prepared Gonka HEAD differs from pinned base SHA")
-        apply_gonka_overlay(overlay_dir, workspace)
-        checked(["git", "-C", str(workspace), "config", "user.name", "Acceptance Runner"], 10)
-        checked(["git", "-C", str(workspace), "config", "user.email", "runner@test.local"], 10)
-        checked(["git", "-C", str(workspace), "add", "-A"], 60)
-        checked(["git", "-C", str(workspace), "commit", "-m",
-                 "test(a8): apply marketplace test overlay"], 30)
-    except BaseException:
-        if cleanup_obj is not None:
-            cleanup_obj.cleanup()
-        raise
-
-    return workspace, cleanup_obj
-
-
-def verify_gonka_test_checkout(
-    gonka_dir: Path, runner: Runner, base_sha: str = EXPECTED_GONKA_SHA
-) -> str:
-    head = runner.run(
-        ["git", "-C", str(gonka_dir), "rev-parse", "HEAD"], timeout=30
-    )
-    if head.returncode != 0:
-        raise AcceptanceError(head.stderr.strip() or "cannot resolve Gonka checkout")
-    actual = head.stdout.strip()
-    if actual in (base_sha, EXPECTED_GONKA_SHA, EXPECTED_GONKA_BASE_SHA):
-        return actual
-    diff = runner.run(
-        [
-            "git",
-            "-C",
-            str(gonka_dir),
-            "diff",
-            "--name-only",
-            f"{base_sha}..{actual}",
-        ],
-        timeout=30,
-    )
-    allowed = (
-        B3_HARNESS_GONKA_PATHS
-        | PR4_MANUAL_WORKFLOW_PATHS
-        | set(A8_RUNTIME_ADAPTER_BLOBS)
-        | OVERLAY_ADDITIONAL_GONKA_PATHS
-    )
-    changed = {line.strip().replace("\\", "/") for line in diff.stdout.splitlines() if line.strip()}
-    if diff.returncode != 0 or not changed or not changed.issubset(allowed):
-        raise AcceptanceError(
-            f"Gonka checkout must be {EXPECTED_GONKA_SHA} or test-only child; "
-            f"HEAD={actual}, changed={sorted(changed)}"
-        )
-    if changed & set(A8_RUNTIME_ADAPTER_BLOBS):
-        for path, expected_blob in A8_RUNTIME_ADAPTER_BLOBS.items():
-            blob = runner.run(
-                ["git", "-C", str(gonka_dir), "rev-parse", f"{actual}:{path}"], timeout=30
-            )
-            if blob.returncode != 0 or blob.stdout.strip() != expected_blob:
-                raise AcceptanceError(f"unreviewed A8 runtime adapter blob: {path}")
-    changed_workflows = changed & PR4_MANUAL_WORKFLOW_PATHS
-    if changed_workflows:
-        pr4_ancestor = runner.run(
-            ["git", "-C", str(gonka_dir), "merge-base", "--is-ancestor", PR4_MANUAL_WORKFLOWS_SHA, actual],
-            timeout=30,
-        )
-        workflow_blobs: dict[str, str] = {}
-        for workflow in sorted(PR4_MANUAL_WORKFLOW_PATHS):
-            blob = runner.run(
-                ["git", "-C", str(gonka_dir), "rev-parse", f"{actual}:{workflow}"],
-                timeout=30,
-            )
-            workflow_blobs[workflow] = blob.stdout.strip()
-            if blob.returncode != 0:
-                break
-        mismatched_workflows = {
-            workflow: {"expected": PR4_MANUAL_WORKFLOW_BLOBS[workflow], "actual": blob}
-            for workflow, blob in workflow_blobs.items()
-            if blob != PR4_MANUAL_WORKFLOW_BLOBS[workflow]
-        }
-        if pr4_ancestor.returncode != 0 or len(workflow_blobs) != len(PR4_MANUAL_WORKFLOW_PATHS) or mismatched_workflows:
-            raise AcceptanceError(
-                "Gonka checkout CI workflows must match pinned PR #4 blobs, with "
-                "the approved P0-preserving manual verify.yml exception; "
-                f"HEAD={actual}, changed_workflows={sorted(changed_workflows)}, "
-                f"mismatched_workflows={compact_json(mismatched_workflows)}"
-            )
-    return actual
 
 
 def git_head(repo: Path, runner: Runner) -> str:
@@ -1659,43 +1564,427 @@ def verified_release_artifacts(
     return paths["marketplace-deal"], paths["marketplace-factory"], manifest
 
 
+def apply_expectation_overrides(args: argparse.Namespace) -> dict[str, str]:
+    """Export the plan's provenance expectations into the environment.
+
+    ``run-live`` is the only entry point the E2E runner invokes directly, but
+    the harness is re-entered by the Kotlin test for ``bootstrap``. Exporting
+    the values here is what makes the guards downstream see the same, single
+    definition of "the selected version".
+    """
+    exported: dict[str, str] = {}
+    simple = (
+        ("expected_gonka_sha", ENV_EXPECTED_GONKA_SHA),
+        ("expected_proto_sha", ENV_EXPECTED_PROTO_SHA),
+    )
+    for attribute, variable in simple:
+        value = (getattr(args, attribute, None) or "").strip()
+        if value:
+            os.environ[variable] = value
+            validated = _env_sha(variable)
+            os.environ[variable] = validated
+            exported[variable] = validated
+
+    pairs = [str(x).strip() for x in (getattr(args, "expected_runtime", None) or []) if str(x).strip()]
+    for pair in pairs:
+        if "=" not in pair:
+            raise AcceptanceError(
+                f"--expected-runtime expects FIELD=VALUE, got {pair!r}"
+            )
+    if pairs:
+        os.environ[ENV_EXPECTED_RUNTIME] = ",".join(pairs)
+        exported[ENV_EXPECTED_RUNTIME] = os.environ[ENV_EXPECTED_RUNTIME]
+
+    # Not part of ``simple`` above: that loop exports SHA-shaped values, while
+    # this one is an opaque model identifier. It is validated here rather than
+    # only at read time so a typo fails the run before any evidence is written.
+    model = (getattr(args, "evidence_model", None) or "").strip()
+    if model:
+        if model in HISTORICAL_EVIDENCE_MODELS:
+            raise AcceptanceError(
+                f"--evidence-model cannot declare historical model {model!r}; "
+                f"only {EVIDENCE_MODEL_IMMUTABLE!r} is produced by new runs. Create a new plan."
+            )
+        if model != EVIDENCE_MODEL_IMMUTABLE:
+            raise AcceptanceError(
+                f"--evidence-model expects {EVIDENCE_MODEL_IMMUTABLE!r}, got {model!r}"
+            )
+        os.environ[ENV_EVIDENCE_MODEL] = model
+        exported[ENV_EVIDENCE_MODEL] = model
+    return exported
+
+
+# ---------------------------------------------------------------------------
+# Immutable-source run-live
+# ---------------------------------------------------------------------------
+
+#: Scenario -> the external Kotlin test it runs (``Class.method``). The class
+#: now lives in ops/a8/harness/testermint and is compiled against the selected
+#: Gonka's unmodified Testermint; the 19 native selectors are unchanged.
+LIVE_SCENARIO_TESTS: dict[str, str] = {
+    "funded-claim": (
+        "MarketplaceContractAcceptanceTests.marketplace funded claim "
+        "settles and releases on real Gonka"
+    ),
+    "no-buyer-claim-expiry": (
+        "MarketplaceContractAcceptanceTests.marketplace no buyer claim expiry "
+        "preserves buyer absence"
+    ),
+    "no-sale-vesting-lifecycle": (
+        "MarketplaceContractAcceptanceTests.marketplace no sale vesting lifecycle "
+        "preserves every asset"
+    ),
+    "funded-routing-refunds": (
+        "MarketplaceContractAcceptanceTests.marketplace funded routing "
+        "refunds are isolated and atomic"
+    ),
+    "unfunded-lock-boundaries": (
+        "MarketplaceContractAcceptanceTests.marketplace unfunded lock "
+        "boundaries preserve buyer absence"
+    ),
+    "funded-gas-sweep": (
+        "MarketplaceContractAcceptanceTests.marketplace claimed refund gas sweep is isolated"
+    ),
+    "claim-expiry-positive": (
+        "MarketplaceContractAcceptanceTests.marketplace positive unclaimed "
+        "summary refunds only at claim expiry"
+    ),
+    "claim-expiry-zero": (
+        "MarketplaceContractAcceptanceTests.marketplace zero unclaimed "
+        "summary refunds only at claim expiry"
+    ),
+    "network-unconfirmed": (
+        "MarketplaceContractAcceptanceTests.marketplace absent native summary "
+        "refunds only at emergency deadline"
+    ),
+    "emergency-host-only-recovery": (
+        "MarketplaceContractAcceptanceTests.marketplace emergency refund host only "
+        "release rolls back and retries"
+    ),
+    "terminal-release-repeat": (
+        "MarketplaceContractAcceptanceTests.marketplace terminal release repeat "
+        "is rejected without payout"
+    ),
+    "b3-foreign-native": (
+        "MarketplaceContractAcceptanceTests.marketplace successful release "
+        "preserves foreign native denom"
+    ),
+    "late-donation-after-completed": (
+        "MarketplaceContractAcceptanceTests.marketplace late liquid donations "
+        "after Completed use cumulative GNK rounding"
+    ),
+    "lock-exact-e": ("MarketplaceContractAcceptanceTests.marketplace funded lock succeeds exactly at E"),
+    "lock-e-plus-4": (
+        "MarketplaceContractAcceptanceTests.marketplace funded lock succeeds "
+        "exactly at E plus 4"
+    ),
+    "lock-e-plus-5": (
+        "MarketplaceContractAcceptanceTests.marketplace funded lock rejects "
+        "exactly at E plus 5"
+    ),
+    "package-a-r1-r2": (
+        "MarketplaceContractAcceptanceTests.marketplace package A preserves R1 refund "
+        "boundary and releases a new vested gift"
+    ),
+    "package-b-r6-1": (
+        "MarketplaceContractAcceptanceTests.marketplace R6 dot 1 rejects all three "
+        "selected CW20 sends then settles once"
+    ),
+    "package-b-r7-1": (
+        "MarketplaceContractAcceptanceTests.marketplace R7 dot 1 rejects selected "
+        "second Bank send then retries once"
+    ),
+}
+B3_SCENARIO = "b3-foreign-native"
+SOURCE_IMMUTABILITY_SCHEMA = "a8.source-immutability-set/1"
+SOURCE_IMMUTABILITY_NETWORK_SCHEMA = "a8.source-immutability-set/2"
+#: Git variables that would redirect any Git call made by Testermint or Gradle
+#: to another repository. The old runner *set* them to make Testermint see the
+#: prepared checkout; now they are removed from every child environment.
+SCRUBBED_CHILD_ENVIRONMENT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", *LEGACY_OVERLAY_ENVIRONMENT)
+
+
+class HarnessRefusal(AcceptanceError):
+    """A fail-closed refusal carrying the stable code of the check that refused."""
+
+    def __init__(self, message: str, *, code: str, details: Mapping[str, Any] | None = None):
+        super().__init__(f"[{code}] {message}")
+        self.code = code
+        self.details = dict(details or {})
+
+
+def _refusal_from(exc: Exception) -> HarnessRefusal:
+    return HarnessRefusal(str(exc), code=getattr(exc, "code", "HARNESS_REFUSED"), details=getattr(exc, "details", None))
+
+
+def _child_env_argv(overrides: Mapping[str, str]) -> list[str]:
+    argv = ["env"]
+    for name in SCRUBBED_CHILD_ENVIRONMENT:
+        argv += ["-u", name]
+    argv += [f"{key}={value}" for key, value in overrides.items()]
+    return argv
+
+
+def _run_logged(runner: Runner, argv: Sequence[str], log_path: Path, timeout: float) -> CommandResult:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = runner.run(argv, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        log_path.write_text(out + err, encoding="utf-8")
+        raise
+    log_path.write_text(result.stdout + result.stderr, encoding="utf-8")
+    return result
+
+
+def _assert_outside_snapshots(path: Path, snapshots: Sequence[Path], what: str) -> None:
+    try:
+        external_harness.assert_work_root_outside(path, snapshots)
+    except external_harness.ExternalHarnessError as exc:
+        raise HarnessRefusal(f"{what} must be outside the source snapshots: {exc}", code=exc.code) from exc
+
+
+def capture_snapshot(root: Path, label: str) -> dict[str, Any]:
+    snapshot = external_harness.load_source_snapshot()
+    try:
+        return snapshot.capture(root)
+    except snapshot.SourceSnapshotError as exc:
+        raise HarnessRefusal(f"{label} snapshot {root}: {exc}", code=exc.code, details=exc.details) from exc
+
+
+def write_source_immutability(
+    evidence_dir: Path,
+    expected: Mapping[str, str],
+    before: Mapping[str, Mapping[str, Any]],
+    after: Mapping[str, Mapping[str, Any] | None],
+    *,
+    network_root_verification: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write ``source-immutability.json``; UNCHANGED only if every root and working copy is."""
+    snapshot = external_harness.load_source_snapshot()
+    roots = {
+        label: snapshot.immutability_record(
+            label=label, expected_sha=expected[label], before=before[label], after=after.get(label)
+        )
+        for label in before
+    }
+    verdicts = {record["verdict"] for record in roots.values()}
+    if network_root_verification is not None:
+        verdicts.add(str(network_root_verification.get("verdict") or "INCOMPLETE"))
+    if verdicts == {"UNCHANGED"}:
+        verdict = "UNCHANGED"
+    elif "VIOLATED" in verdicts:
+        verdict = "VIOLATED"
+    else:
+        verdict = "INCOMPLETE"
+    document: dict[str, Any] = {
+        "schema": (
+            SOURCE_IMMUTABILITY_NETWORK_SCHEMA
+            if network_root_verification is not None else SOURCE_IMMUTABILITY_SCHEMA
+        ),
+        "roots": roots, "verdict": verdict,
+    }
+    if network_root_verification is not None:
+        document["network_root"] = dict(network_root_verification)
+    external_harness.write_json(Path(evidence_dir) / "source-immutability.json", document)
+    return document
+
+
+def assert_snapshots_pristine(
+    evidence_dir: Path,
+    expected: Mapping[str, str],
+    before: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Refuse before any build step when a snapshot is not exactly its commit.
+
+    The refusal is itself evidence: ``source-immutability.json`` is written
+    with the violations before the error propagates.
+    """
+    snapshot = external_harness.load_source_snapshot()
+    problems = {
+        label: snapshot.pristine_violations(before[label], expected_sha=expected[label])
+        for label in before
+    }
+    if any(problems.values()):
+        write_source_immutability(evidence_dir, expected, before, {label: None for label in before})
+        codes = sorted({item["code"] for items in problems.values() for item in items})
+        raise HarnessRefusal(
+            "source snapshot is not exactly the selected commit: "
+            + "; ".join(
+                f"{label}: {', '.join(sorted({item['code'] for item in items}))}"
+                for label, items in problems.items()
+                if items
+            ),
+            code=codes[0],
+            details={"problems": problems},
+        )
+
+
+def run_required_api_check(gonka_dir: Path, harness_dir: Path, external_dir: Path) -> dict[str, Any]:
+    """Check the upstream API before any network exists; the result is evidence."""
+    spec = Path(harness_dir) / "required-upstream-api.json"
+    try:
+        result = external_harness.evaluate_required_upstream_api(gonka_dir, spec)
+    except external_harness.ExternalHarnessError as exc:
+        raise _refusal_from(exc) from exc
+    external_harness.write_json(Path(external_dir) / "api-compat.json", result)
+    try:
+        external_harness.check_required_upstream_api(gonka_dir, spec)
+    except external_harness.ExternalHarnessError as exc:
+        raise _refusal_from(exc) from exc
+    return result
+
+
+def export_upstream_classpath(
+    runner: Runner,
+    gonka_dir: Path,
+    harness_dir: Path,
+    layout: Any,
+    external_dir: Path,
+    timeout: float,
+) -> Path:
+    """Compile the unmodified upstream Testermint out of tree; keep its classpath."""
+    try:
+        argv = external_harness.upstream_classpath_argv(gonka_dir, harness_dir, layout)
+    except external_harness.ExternalHarnessError as exc:
+        raise _refusal_from(exc) from exc
+    command = [*_child_env_argv(external_harness.gradle_environment(layout)), *argv]
+    log_path = Path(external_dir) / "upstream-classpath.log"
+    deadline = time.monotonic() + timeout
+    attempts: list[str] = []
+    for attempt in range(1, 4):
+        try:
+            result = _run_logged(runner, command, log_path, _remaining(deadline))
+        except subprocess.TimeoutExpired:
+            attempts.append(log_path.read_text(encoding="utf-8") if log_path.exists() else "")
+            log_path.write_text("".join(attempts), encoding="utf-8")
+            raise
+        output = result.stdout + result.stderr
+        attempts.append(f"=== Upstream classpath preparation attempt {attempt}/3 ===\n{output}\n")
+        log_path.write_text("".join(attempts), encoding="utf-8")
+        # A wrapper download happens before Gradle or a chain starts. Retry only
+        # its explicit network timeout, never compilation, assertions or a live
+        # scenario. Each attempt stays within the original preparation budget.
+        wrapper_timeout = (
+            "org.gradle.wrapper.Download.download" in output
+            and re.search(r"Downloading from https://[^\s]+/gradle-[^\s/]+\.zip failed: timeout", output)
+        )
+        if (
+            result.returncode == 0 or attempt == 3 or not wrapper_timeout
+            or layout.classpath_file.exists()
+        ):
+            break
+        delay = 2.0 if attempt == 1 else 5.0
+        if _remaining(deadline) <= delay:
+            break
+        time.sleep(delay)
+    if result.returncode != 0 or not layout.classpath_file.is_file():
+        raise AcceptanceError(
+            f"upstream Testermint classpath export failed; see {Path(external_dir) / 'upstream-classpath.log'}"
+        )
+    shutil.copyfile(layout.classpath_file, Path(external_dir) / "testermint-classpath.txt")
+    side_output = layout.classpath_file.with_name(layout.classpath_file.name + ".json")
+    if side_output.is_file() and not side_output.is_symlink():
+        shutil.copyfile(side_output, Path(external_dir) / side_output.name)
+    return layout.classpath_file
+
+
+def write_harness_inputs(gonka_dir: Path, harness_dir: Path, layout: Any, external_dir: Path) -> Path:
+    try:
+        inputs = external_harness.harness_inputs(
+            harness_dir=harness_dir, gonka_dir=gonka_dir, classpath_file=layout.classpath_file
+        )
+    except external_harness.ExternalHarnessError as exc:
+        raise _refusal_from(exc) from exc
+    side_output = layout.classpath_file.with_name(layout.classpath_file.name + ".json")
+    if side_output.is_file():
+        inputs["classpath_metadata"] = {"path": str(side_output), "sha256": sha256_file(side_output)}
+    return external_harness.write_json(Path(external_dir) / "harness-inputs.json", inputs)
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired("run-live", 0)
+    return remaining
+
+
 def run_live(args: argparse.Namespace) -> None:
+    """One live scenario against two read-only snapshots (immutable-source model).
+
+    Order matters and is the contract: both snapshots are proven pristine
+    before anything is built; the upstream API is checked before any network
+    exists; everything the run writes goes to the work root or the evidence
+    directory; and both snapshots are measured again afterwards. A violation at
+    any point fails the run with a non-zero exit while keeping the evidence.
+    """
     runner = Runner()
     repo = Path(args.marketplace_dir).resolve()
-    base_gonka_dir = Path(args.gonka_dir).resolve()
-    overlay_dir = Path(getattr(args, "overlay_dir", None) or DEFAULT_GONKA_OVERLAY_DIR).resolve()
+    gonka_dir = Path(args.gonka_dir).resolve()
 
-    use_temp = not getattr(args, "no_temp_gonka", False)
-    keep_temp = getattr(args, "keep_temp_gonka", False)
-    temp_dir_arg = getattr(args, "temp_gonka_dir", None)
-
-    cleanup_obj = None
-    if use_temp:
-        target_ws = Path(temp_dir_arg).resolve() if temp_dir_arg else None
-        gonka_dir, cleanup_obj = prepare_temporary_gonka_workspace(
-            base_gonka_dir,
-            overlay_dir,
-            runner,
-            target_dir=target_ws,
-            keep_temp=keep_temp,
-        )
-    else:
-        gonka_dir = base_gonka_dir
-
-    test_head = verify_gonka_test_checkout(
-        gonka_dir,
-        runner,
-        base_sha=EXPECTED_GONKA_BASE_SHA if use_temp else EXPECTED_GONKA_SHA,
-    )
-    dirty = runner.run(
-        ["git", "-C", str(gonka_dir), "status", "--porcelain=v1"], timeout=30
-    )
-    if dirty.returncode != 0 or dirty.stdout.strip():
+    refuse_legacy_overlay_environment()
+    # Publish the plan's provenance expectations before anything reads them.
+    # They travel by environment because Testermint re-enters this script for
+    # ``bootstrap`` and cannot forward new flags.
+    apply_expectation_overrides(args)
+    requested_gonka_sha = expected_gonka_sha()
+    model = evidence_model()
+    expected_marketplace = (getattr(args, "expected_marketplace_sha", None) or "").strip().lower() or None
+    if expected_marketplace is not None and (
+        len(expected_marketplace) != 40 or not set(expected_marketplace).issubset(_FULL_SHA_CHARS)
+    ):
         raise AcceptanceError(
-            "Gonka test checkout must be clean before Testermint reboot:\n"
-            + dirty.stdout.rstrip()
+            f"--expected-marketplace-sha must be a full 40-hex commit SHA; got {expected_marketplace!r}"
         )
-    assert_fresh_gonka_local_state(gonka_dir)
+    if not args.manifest:
+        raise AcceptanceError(
+            "--manifest is required by the E2E runner; standalone A9 release build in run-live is not supported"
+        )
+    if args.scenario not in LIVE_SCENARIO_TESTS:
+        raise AcceptanceError(f"unknown live scenario {args.scenario!r}")
+    test_name = LIVE_SCENARIO_TESTS[args.scenario]
+    b3 = args.scenario == B3_SCENARIO
+
+    run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d%H%M%S")
+    harness_dir = Path(
+        getattr(args, "testermint_harness_dir", None) or external_harness.DEFAULT_TESTERMINT_HARNESS_DIR
+    ).resolve()
+    work_root = (
+        Path(args.work_root).resolve()
+        if getattr(args, "work_root", None)
+        else external_harness.default_work_root(gonka_dir, run_id)
+    )
+    evidence_root = Path(args.evidence_dir).resolve()
+    snapshots = (gonka_dir, repo)
+    _assert_outside_snapshots(work_root, snapshots, "--work-root")
+    _assert_outside_snapshots(evidence_root, snapshots, "--evidence-dir")
+    _assert_outside_snapshots(harness_dir, snapshots, "--testermint-harness-dir")
+
+    gradle_user_home = (
+        Path(args.gradle_user_home).resolve()
+        if getattr(args, "gradle_user_home", None) else None
+    )
+    if gradle_user_home is not None:
+        _assert_outside_snapshots(gradle_user_home, snapshots, "--gradle-user-home")
+
+    evidence_dir = evidence_root / run_id
+    evidence_dir.mkdir(parents=True, exist_ok=False)
+    context = evidence_dir / "live-context.json"
+    external_dir = evidence_dir / "external-harness"
+    external_dir.mkdir()
+    deadline = time.monotonic() + args.timeout_minutes * 60
+
+    # 1. Both snapshots are exactly their selected commits before anything runs.
+    before = {
+        "gonka": capture_snapshot(gonka_dir, "gonka"),
+        "marketplace": capture_snapshot(repo, "marketplace"),
+    }
+    expected = {
+        "gonka": requested_gonka_sha,
+        "marketplace": expected_marketplace or before["marketplace"]["head"],
+    }
+    assert_snapshots_pristine(evidence_dir, expected, before)
 
     collisions = docker_resource_collisions(runner)
     if any(collisions.values()):
@@ -1705,43 +1994,35 @@ def run_live(args: argparse.Namespace) -> None:
             + compact_json(collisions)
         )
 
-    run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d%H%M%S")
-    evidence_dir = Path(args.evidence_dir).resolve() / run_id
-    evidence_dir.mkdir(parents=True, exist_ok=False)
-    context = evidence_dir / "live-context.json"
-
-    marketplace_dirty = runner.run(
-        ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=no"],
-        timeout=30,
-    )
-    if marketplace_dirty.returncode != 0 or marketplace_dirty.stdout.strip():
-        raise AcceptanceError("Marketplace checkout must be clean before A9 provenance")
-    if args.manifest:
-        manifest_path = Path(args.manifest).resolve()
-    else:
-        release_dir = evidence_dir / "a9-release"
-        build = runner.run(
-            [
-                sys.executable,
-                str(repo / "scripts" / "a9_release.py"),
-                "build",
-                "--commit",
-                "HEAD",
-                "--output",
-                str(release_dir),
-            ],
-            timeout=30 * 60,
-        )
-        if build.returncode != 0:
-            raise AcceptanceError(build.stderr.strip() or "A9 release build failed")
-        manifest_path = release_dir / "build-manifest.json"
+    manifest_path = Path(args.manifest).resolve()
     deal, factory, manifest = verified_release_artifacts(repo, manifest_path, runner)
 
-    test_target = evidence_dir / "test-wasm-target"
+    # 2. Required upstream API, before any network is created.
+    run_required_api_check(gonka_dir, harness_dir, external_dir)
+
+    # 3. The network root: full working copy of Gonka + runner files.
+    layout = external_harness.WorkLayout(work_root, gradle_user_home=gradle_user_home)
+    network_manifest_path = evidence_dir / "network" / "network-manifest.json"
+    try:
+        network_manifest = external_harness.prepare_network_root(
+            gonka_dir,
+            layout.network_root,
+            external_harness.DEFAULT_NETWORK_TEMPLATES_DIR,
+            b3=b3,
+            manifest_path=network_manifest_path,
+        )
+    except external_harness.ExternalHarnessError as exc:
+        raise _refusal_from(exc) from exc
+    layout.create()
+
+    # 4. Test-only Wasm fixtures, built outside both snapshots.
+    test_target = layout.wasm_target
     test_build = runner.run(
         [
             "cargo",
             "build",
+            "--manifest-path",
+            str(repo / "Cargo.toml"),
             "-p",
             "a8-caller",
             "-p",
@@ -1766,166 +2047,202 @@ def run_live(args: argparse.Namespace) -> None:
         if not artifact.is_file():
             raise AcceptanceError(f"required verified Wasm artifact missing: {artifact}")
 
-    gradle = gonka_dir / "testermint" / "gradlew"
-    c_binary = None
-    if args.scenario == "package-c-query-faults":
-        if os.name == "nt":
-            raise AcceptanceError("C must use the Linux snapshot launcher")
-        export = evidence_dir / "c-runtime-export"
-        if export.exists():
-            raise AcceptanceError("C runtime exporter destination already exists")
-        build_command = [
-            "docker", "build", "--file", str(gonka_dir / "inference-chain/Dockerfile"),
-            "--target", "binary-exporter", "--build-arg", "TAGS=a8faults",
-            "--output", f"type=local,dest={export}", str(gonka_dir),
-        ]
-        # Build before starting Testermint. A failure here is infrastructure,
-        # not evidence that a blockchain case ran.
-        build_result = runner.run(build_command, timeout=20 * 60)
-        (evidence_dir / "c-runtime-build.log").write_text(
-            build_result.stdout + build_result.stderr, encoding="utf-8")
-        c_binary = export / "build_output/inferenced"
-        if build_result.returncode != 0 or not c_binary.is_file():
-            raise AcceptanceError("C tagged binary build failed; see c-runtime-build.log")
-        c_binary.chmod(0o755)
-        write_object(evidence_dir / "c-runtime-build.json", {
-            "level": "NATIVE-FAULT", "production_evidence": False,
-            "gonka_source_sha": test_head, "command": build_command,
-            "binary_sha256": sha256_file(c_binary), "build_tag": "a8faults",
-            "runtime_adapter_blobs": A8_RUNTIME_ADAPTER_BLOBS,
-        })
-    wrapper = gonka_dir / "testermint" / "gradlew.a8-wsl"
-    if wrapper.exists():
-        raise AcceptanceError(f"temporary Gradle wrapper already exists: {wrapper}")
-    wrapper.write_bytes(gradle.read_bytes().replace(b"\r\n", b"\n"))
+    container_control_dir = evidence_dir / "container-control"
+    container_control_dir.mkdir()
+    log_path = evidence_dir / "testermint.log"
+    failures: list[str] = []
+    junit_summary: dict[str, Any] | None = None
+    after: dict[str, Any] = {}
+    result: CommandResult | None = None
     try:
-        wsl_gonka = wsl_path(gonka_dir, runner)
-        wsl_repo = wsl_path(repo, runner)
-        wsl_context = wsl_path(context, runner)
-        wsl_git_dir = wsl_path(
-            Path(runner.run(
-                ["git", "-C", str(gonka_dir), "rev-parse", "--absolute-git-dir"],
-                timeout=30,
-            ).stdout.strip()),
-            runner,
-        )
-        env = [
-            f"GIT_DIR={wsl_git_dir}",
-            f"GIT_WORK_TREE={wsl_gonka}",
-            "A8_PYTHON=/usr/bin/python3",
-            f"A8_HARNESS={wsl_repo}/scripts/a8_acceptance.py",
-            f"A8_MARKETPLACE_DIR={wsl_repo}",
-            f"A8_GONKA_DIR={wsl_gonka}",
-            f"A8_CONTEXT={wsl_context}",
-            f"A8_RUN_ID={run_id}",
-            f"A8_DEAL_WASM={wsl_path(deal, runner)}",
-            f"A8_FACTORY_WASM={wsl_path(factory, runner)}",
-            f"A8_CW20_WASM={wsl_path(cw20, runner)}",
-            f"A8_CALLER_WASM={wsl_path(caller, runner)}",
-        ]
-        if c_binary is not None:
-            env.append(f"A8_C_BINARY={wsl_path(c_binary, runner)}")
-        test_name = {
-            "package-c-query-faults": (
-                "MarketplaceContractAcceptanceTests.marketplace package C proves query faults and recovery"
+        # 5. Upstream Testermint compiled unmodified, out of tree.
+        export_upstream_classpath(runner, gonka_dir, harness_dir, layout, external_dir, _remaining(deadline))
+        write_harness_inputs(gonka_dir, harness_dir, layout, external_dir)
+
+        # 6. The external harness test run.
+        env = {
+            "A8_PYTHON": "/usr/bin/python3",
+            # Testermint re-enters this harness for bootstrap and for every
+            # scenario phase. It must re-enter *this* script - the one the
+            # runner image owns and the lock records - and never a copy that
+            # happens to sit in the checkout under test.
+            "A8_HARNESS": str(HARNESS_SCRIPT_PATH),
+            "A8_MARKETPLACE_DIR": str(repo),
+            "A8_GONKA_DIR": str(gonka_dir),
+            "A8_CONTEXT": str(context),
+            "A8_RUN_ID": run_id,
+            "A8_DEAL_WASM": str(deal),
+            "A8_FACTORY_WASM": str(factory),
+            "A8_CW20_WASM": str(cw20),
+            "A8_CALLER_WASM": str(caller),
+            ENV_EXPECTED_GONKA_SHA: requested_gonka_sha,
+            ENV_EXPECTED_PROTO_SHA: expected_proto_sha(),
+            ENV_EVIDENCE_MODEL: model,
+            **(
+                {ENV_EXPECTED_RUNTIME: os.environ[ENV_EXPECTED_RUNTIME]}
+                if os.environ.get(ENV_EXPECTED_RUNTIME)
+                else {}
             ),
-            "full": (
-                "MarketplaceContractAcceptanceTests.marketplace funded claim "
-                "settles and releases on real Gonka"
-            ),
-            "claim-expiry-positive": (
-                "MarketplaceContractAcceptanceTests.marketplace positive unclaimed "
-                "summary refunds only at claim expiry"
-            ),
-            "claim-expiry-zero": (
-                "MarketplaceContractAcceptanceTests.marketplace zero unclaimed "
-                "summary refunds only at claim expiry"
-            ),
-            "network-unconfirmed": (
-                "MarketplaceContractAcceptanceTests.marketplace absent native summary "
-                "refunds only at emergency deadline"
-            ),
-            "terminal-release-repeat": (
-                "MarketplaceContractAcceptanceTests.marketplace terminal release repeat "
-                "is a native no-op"
-            ),
-            "b3-foreign-native": (
-                "MarketplaceContractAcceptanceTests.marketplace successful release "
-                "preserves foreign native denom"
-            ),
-            "late-donation-after-completed": (
-                "MarketplaceContractAcceptanceTests.marketplace late liquid donations "
-                "after Completed use cumulative GNK rounding"
-            ),
-            "lock-exact-e": ("MarketplaceContractAcceptanceTests.marketplace funded lock succeeds exactly at E"),
-            "lock-e-plus-4": (
-                "MarketplaceContractAcceptanceTests.marketplace funded lock succeeds "
-                "exactly at E plus 4"
-            ),
-            "lock-e-plus-5": (
-                "MarketplaceContractAcceptanceTests.marketplace funded lock rejects "
-                "exactly at E plus 5"
-            ),
-            "package-a-r1-r2": (
-                "MarketplaceContractAcceptanceTests.marketplace package A preserves R1 refund "
-                "boundary and releases a new vested gift"
-            ),
-            "package-b-r6-1": (
-                "MarketplaceContractAcceptanceTests.marketplace R6 dot 1 rejects all three "
-                "selected CW20 sends then settles once"
-            ),
-            "package-b-r7-1": (
-                "MarketplaceContractAcceptanceTests.marketplace R7 dot 1 rejects selected "
-                "second Bank send then retries once"
-            ),
-        }[args.scenario]
-        command = [
-            *(["wsl.exe", "-d", "Ubuntu", "--"] if os.name == "nt" else []),
-            "env",
-            *env,
-            "bash",
-            "-lc",
-            f"cd {wsl_gonka}/testermint && chmod +x gradlew.a8-wsl && "
-            "./gradlew.a8-wsl :test --tests "
-            f"'{test_name}' "
-            "-DexcludeTags=unstable,exclude",
-        ]
-        result = runner.run(command, timeout=args.timeout_minutes * 60)
-        log_path = evidence_dir / "testermint.log"
+            # Testermint reads compose files and resources from here, never
+            # from the Gonka snapshot. Provenance is proven separately.
+            "GONKA_REPO_ROOT": str(layout.network_root),
+            "A8_CONTAINER_CONTROL": str(external_harness.CONTAINER_CONTROL_PATH),
+            "A8_CONTAINER_CONTROL_STATE_DIR": str(container_control_dir),
+            "A8_OWNERSHIP_LABEL": external_harness.OWNERSHIP_LABEL,
+            **external_harness.gradle_environment(layout),
+        }
+        try:
+            gradle = external_harness.harness_gradle_argv(
+                gonka_dir, harness_dir, layout, tasks=["test"], test_name=test_name
+            )
+        except external_harness.ExternalHarnessError as exc:
+            raise _refusal_from(exc) from exc
+        command = [*_child_env_argv(env), *gradle]
         # The dedicated test and harness never print key material. Keep the
         # bounded runner output for failure diagnostics and reproducibility.
-        log_path.write_text(result.stdout + result.stderr, encoding="utf-8")
-        if context.is_file():
-            context_value = load_object(context)
-            context_value["source"]["gonka_test_harness_sha"] = test_head
-            context_value["source"]["marketplace_commit_sha"] = manifest[
-                "marketplace_commit_sha"
-            ]
-            context_value["source"]["a9_manifest_sha256"] = sha256_file(manifest_path)
-            context_value["source"]["a9_contract_sha256"] = {
-                "deal": sha256_file(deal),
-                "factory": sha256_file(factory),
-            }
-            context_value["source"]["test_contract_sha256"] = {
-                "caller": sha256_file(caller),
-                "cw20": sha256_file(cw20),
-            }
-            context_value["command"] = {
-                "entrypoint": "python scripts/a8_acceptance.py run-live",
-                "scenario": args.scenario,
-                "test": test_name,
-            }
-            write_object(context, context_value)
+        result = _run_logged(runner, command, log_path, _remaining(deadline))
         if result.returncode != 0:
-            raise AcceptanceError(
-                f"Testermint marketplace scenario failed; see {log_path}"
+            failures.append(f"Testermint marketplace scenario failed; see {log_path}")
+
+        # 7. JUnit from the external build; a selected test that did not run fails.
+        try:
+            junit_summary = external_harness.collect_junit(
+                layout.junit_results_dir, evidence_dir / "testermint-junit", test_name
             )
-        print(compact_json({"status": "pass", "evidence": str(evidence_dir)}))
+            if junit_summary["failed"]:
+                failures.append(f"selected test {test_name!r} failed in JUnit")
+        except external_harness.ExternalHarnessError as exc:
+            failures.append(f"[{exc.code}] {exc}")
     finally:
-        if wrapper is not None:
-            wrapper.unlink(missing_ok=True)
-        if cleanup_obj is not None:
-            cleanup_obj.cleanup()
+        # 8. Both snapshots and the working copy again, whatever happened above.
+        for label, root in (("gonka", gonka_dir), ("marketplace", repo)):
+            try:
+                after[label] = external_harness.load_source_snapshot().capture(root)
+            except Exception:  # noqa: BLE001 - an unmeasurable root is INCOMPLETE
+                after[label] = None
+        try:
+            network_verification = external_harness.verify_network_root_integrity(
+                layout.network_root,
+                network_manifest,
+                manifest_path=network_manifest_path,
+            )
+        except Exception:  # noqa: BLE001 - an unmeasurable working copy is INCOMPLETE
+            network_verification = {"verdict": "INCOMPLETE", "violations": [], "runtime_additions": []}
+        immutability = write_source_immutability(
+            evidence_dir,
+            expected,
+            before,
+            after,
+            network_root_verification=network_verification,
+        )
+
+    if immutability["verdict"] != "UNCHANGED":
+        failures.insert(0, f"[SOURCE_SNAPSHOT_MUTATED] source immutability {immutability['verdict']}")
+
+    # 9. B3 genesis: the provisioner's own record, verified as an exact delta.
+    b3_verification = None
+    if b3:
+        b3_verification = external_harness.collect_b3_genesis_evidence(
+            layout.network_root / external_harness.PROVISION_DIR_IN_PROD_LOCAL,
+            evidence_dir / "genesis",
+        )
+        if b3_verification["verdict"] != "PASS":
+            failures.append(
+                "B3 genesis verification failed: "
+                + ", ".join(sorted({item["code"] for item in b3_verification["findings"]}))
+            )
+
+    # 10. live-context.json source fields for the immutable-source model.
+    if context.is_file():
+        context_value = load_object(context)
+        source = context_value.setdefault("source", {})
+        for stale in ("gonka_prepared_sha", "gonka_overlay_manifest_sha256", "gonka_test_harness_sha", "gonka_base_sha"):
+            source.pop(stale, None)
+        source["evidence_model"] = model
+        source["gonka_sha"] = requested_gonka_sha
+        source["gonka_tree_sha"] = before["gonka"]["tree"]
+        source["marketplace_commit_sha"] = manifest["marketplace_commit_sha"]
+        source["marketplace_tree_sha"] = before["marketplace"]["tree"]
+        source["source_immutability_verdict"] = immutability["verdict"]
+        source["source_immutability_sha256"] = sha256_file(evidence_dir / "source-immutability.json")
+        inputs_path = external_dir / "harness-inputs.json"
+        source["external_harness_inputs_sha256"] = sha256_file(inputs_path) if inputs_path.is_file() else None
+        source["network_manifest_sha256"] = sha256_file(network_manifest_path)
+        source["a9_manifest_sha256"] = sha256_file(manifest_path)
+        source["a9_contract_sha256"] = {"deal": sha256_file(deal), "factory": sha256_file(factory)}
+        source["test_contract_sha256"] = {"caller": sha256_file(caller), "cw20": sha256_file(cw20)}
+        command_record = {
+            "entrypoint": "python scripts/a8_acceptance.py run-live",
+            "scenario": args.scenario,
+            "test": test_name,
+        }
+        source["command"] = command_record
+        context_value["command"] = command_record
+        write_object(context, context_value)
+    elif not failures:
+        # Absence is never agreement: a green Gradle run without bootstrap
+        # evidence proves nothing about the chain.
+        failures.append(f"live context {context} was not written by the scenario")
+
+    if failures:
+        raise AcceptanceError("; ".join(failures) + f" (evidence kept in {evidence_dir})")
+    print(compact_json({"status": "pass", "evidence": str(evidence_dir)}))
+
+
+def build_external_harness(args: argparse.Namespace) -> None:
+    """Build-only half of run-live: no network, no Docker.
+
+    Pristine check of the Gonka snapshot, required-API check, upstream
+    classpath export, harness ``testClasses`` and the after-snapshot
+    comparison -- the same functions run-live uses, so a green build here
+    means exactly what the corresponding run-live steps would mean.
+    """
+    runner = Runner()
+    refuse_legacy_overlay_environment()
+    gonka_dir = Path(args.gonka_dir).resolve()
+    work_root = Path(args.work_root).resolve()
+    harness_dir = Path(args.testermint_harness_dir or external_harness.DEFAULT_TESTERMINT_HARNESS_DIR).resolve()
+    evidence_dir = Path(args.evidence_dir).resolve() if args.evidence_dir else work_root / "evidence"
+    for path, what in ((work_root, "--work-root"), (evidence_dir, "--evidence-dir"), (harness_dir, "--testermint-harness-dir")):
+        _assert_outside_snapshots(path, (gonka_dir,), what)
+    expected_sha = (args.expected_gonka_sha or "").strip().lower() or None
+    if expected_sha is not None and (len(expected_sha) != 40 or not set(expected_sha).issubset(_FULL_SHA_CHARS)):
+        raise AcceptanceError(f"--expected-gonka-sha must be a full 40-hex commit SHA; got {expected_sha!r}")
+    external_dir = evidence_dir / "external-harness"
+    external_dir.mkdir(parents=True, exist_ok=True)
+
+    before = {"gonka": capture_snapshot(gonka_dir, "gonka")}
+    expected = {"gonka": expected_sha or before["gonka"]["head"]}
+    assert_snapshots_pristine(evidence_dir, expected, before)
+    run_required_api_check(gonka_dir, harness_dir, external_dir)
+
+    layout = external_harness.WorkLayout(work_root)
+    layout.create()
+    deadline = time.monotonic() + args.timeout_minutes * 60
+    failures: list[str] = []
+    after: dict[str, Any] = {}
+    try:
+        export_upstream_classpath(runner, gonka_dir, harness_dir, layout, external_dir, _remaining(deadline))
+        write_harness_inputs(gonka_dir, harness_dir, layout, external_dir)
+        try:
+            gradle = external_harness.harness_gradle_argv(gonka_dir, harness_dir, layout, tasks=["testClasses"])
+        except external_harness.ExternalHarnessError as exc:
+            raise _refusal_from(exc) from exc
+        command = [*_child_env_argv(external_harness.gradle_environment(layout)), *gradle]
+        result = _run_logged(runner, command, external_dir / "harness-build.log", _remaining(deadline))
+        if result.returncode != 0:
+            failures.append(f"external harness build failed; see {external_dir / 'harness-build.log'}")
+    finally:
+        try:
+            after["gonka"] = external_harness.load_source_snapshot().capture(gonka_dir)
+        except Exception:  # noqa: BLE001 - an unmeasurable root is INCOMPLETE
+            after["gonka"] = None
+        immutability = write_source_immutability(evidence_dir, expected, before, after)
+    if immutability["verdict"] != "UNCHANGED":
+        failures.insert(0, f"[SOURCE_SNAPSHOT_MUTATED] source immutability {immutability['verdict']}")
+    if failures:
+        raise AcceptanceError("; ".join(failures) + f" (evidence kept in {evidence_dir})")
+    print(compact_json({"status": "pass", "evidence": str(evidence_dir)}))
 
 
 def assert_chain(gonka: DockerGonka) -> dict[str, Any]:
@@ -2169,8 +2486,22 @@ def bootstrap(args: argparse.Namespace) -> None:
         "run_id": run_id,
         "level": "live_network",
         "source": {
-            "gonka_sha": EXPECTED_GONKA_SHA,
-            "protobuf_sha": EXPECTED_PROTO_SHA,
+            # Two different facts that must never be conflated:
+            #   gonka_source_sha - the commit the user asked to prove; the
+            #                      snapshot is exactly this commit (there is
+            #                      no "prepared" child any more)
+            #   runtime          - what the running binary actually reports
+            # The verifier checks each against its own expectation.
+            #
+            # ``evidence_model`` says under which rules they were produced.
+            # Historical packages carry the overlay or prepared-build models,
+            # whose fields mean different things; a consumer must never have
+            # to guess. run-live later adds the tree SHAs and the
+            # source-immutability verdict to this same dictionary.
+            "evidence_model": evidence_model(),
+            "gonka_source_sha": expected_gonka_sha(),
+            "gonka_sha": expected_gonka_sha(),
+            "protobuf_sha": expected_proto_sha(),
             "runtime": runtime_identity,
             **(
                 {"native_test_configuration": native_test_configuration}
@@ -2441,7 +2772,17 @@ def lock_scenario(args: argparse.Namespace) -> None:
         "inference", "list-claim-recipients", scenario["accounts"]["host"]
     )
     before = gonka.smart(deal, {"state": {}})
+    before_epoch = epoch_observation(gonka)
+    target_epoch = require_uint(scenario["terms"]["target_epoch"], "scenario epoch")
+    expected_epoch = target_epoch + 4 if args.name == "lock-e-plus-4" else None
+    if expected_epoch is not None and before_epoch["epoch"] != expected_epoch:
+        raise AcceptanceError(
+            f"unfunded E+4 Lock requires epoch {expected_epoch}, got {before_epoch['epoch']}"
+        )
     tx = gonka.execute(DEFAULT_NODE, "genesis", deal, {"lock": {}}, gas="auto")
+    after_epoch = epoch_observation(gonka)
+    epoch_bracket = assert_tx_epoch_bracket(tx, before_epoch, after_epoch)
+    assert_no_bank_transfer_involving(tx, deal)
     after = gonka.smart(deal, {"state": {}})
     if before.get("status") not in ("open", "funded") or after.get("status") != "locked":
         raise AcceptanceError(f"scenario Lock transition mismatch: {before} -> {after}")
@@ -2451,6 +2792,8 @@ def lock_scenario(args: argparse.Namespace) -> None:
         {
             "name": "lock",
             "tx": filtered_tx(tx),
+            "expected_epoch": expected_epoch,
+            "epoch_bracket": epoch_bracket,
             "recipient_query": recipients,
             "state_before": before,
             "state_after": after,
@@ -2812,6 +3155,12 @@ def lock_rejected_scenario(args: argparse.Namespace) -> None:
     if args.routing == "pruned" and present:
         raise AcceptanceError("recipient row was not pruned at the expected boundary")
     baseline = scenario_financial_snapshot(gonka, context, scenario)
+    expected_epoch = epoch + 5
+    before_epoch = epoch_observation(gonka)
+    if before_epoch["epoch"] != expected_epoch:
+        raise AcceptanceError(
+            f"unfunded E+5 Lock rejection requires epoch {expected_epoch}, got {before_epoch['epoch']}"
+        )
     attempt = gonka.tx_attempt(
         DEFAULT_NODE,
         "genesis",
@@ -2821,6 +3170,8 @@ def lock_rejected_scenario(args: argparse.Namespace) -> None:
         compact_json({"lock": {}}),
         gas=str(args.gas),
     )
+    after_epoch = epoch_observation(gonka)
+    epoch_bracket = assert_tx_epoch_bracket(attempt, before_epoch, after_epoch)
     if attempt["code"] == 0:
         raise AcceptanceError("late Lock unexpectedly succeeded")
     final = scenario_financial_snapshot(gonka, context, scenario)
@@ -2829,6 +3180,8 @@ def lock_rejected_scenario(args: argparse.Namespace) -> None:
     context["scenarios"][args.name]["phases"].append(
         {
             "name": "lock_rejected",
+            "expected_epoch": expected_epoch,
+            "epoch_bracket": epoch_bracket,
             "routing_expectation": args.routing,
             "recipient_query": recipients,
             "attempt": attempt,
@@ -3168,6 +3521,11 @@ def settle_scenario(args: argparse.Namespace) -> None:
             **{role: gonka.cw20_balance(cw20, address) for role, address in addresses.items()},
             "deal": gonka.cw20_balance(cw20, deal),
         },
+        "foreign_cw20": (
+            gonka.cw20_balance(context["contracts"]["foreign_cw20"], deal)
+            if isinstance(context.get("contracts", {}).get("foreign_cw20"), str)
+            else None
+        ),
     }
     tx = gonka.execute(DEFAULT_NODE, "genesis", deal, {"settle_claim": {}}, gas="auto")
     record_settlement_phase(path, {
@@ -3184,6 +3542,11 @@ def settle_scenario(args: argparse.Namespace) -> None:
             **{role: gonka.cw20_balance(cw20, address) for role, address in addresses.items()},
             "deal": gonka.cw20_balance(cw20, deal),
         },
+        "foreign_cw20": (
+            gonka.cw20_balance(context["contracts"]["foreign_cw20"], deal)
+            if isinstance(context.get("contracts", {}).get("foreign_cw20"), str)
+            else None
+        ),
     }
     actual_deltas = {
         role: after["cw20"][role] - before["cw20"][role]
@@ -3209,71 +3572,58 @@ def settle_scenario(args: argparse.Namespace) -> None:
     print(compact_json({"scenario": args.name, "status": after["state"]["status"]}))
 
 
-def is_completed_release_noop(state: Mapping[str, Any], deal_balance: int) -> bool:
-    return state.get("status") == "completed" and deal_balance == 0
+GNK_RELEASE_MSG: dict[str, Any] = {"release_unlocked_gnk": {}}
 
 
-def release_scenario(args: argparse.Namespace) -> None:
-    path = Path(args.context)
-    context = load_object(path)
-    scenario = named_scenario_or_bootstrap(context, args.name)
-    gonka = DockerGonka(Runner(), context["chain"]["chain_id"])
-    assert_chain(gonka)
-    deal = scenario["contracts"]["deal"]
-    host = scenario["accounts"]["host"]
-    buyer = scenario["accounts"].get("buyer") or context["accounts"]["buyer"]
+def open_gnk_release(
+    gonka: DockerGonka,
+    deal: str,
+    host: str,
+    buyer: str,
+    foreign: str | None = None,
+) -> dict[str, Any]:
+    """Read everything a release receipt needs before the transaction runs."""
     caller = gonka.key_address(DEFAULT_NODE, "genesis")
-    caller_before = gonka.bank_balance(caller)
-    epoch_before = epoch_observation(gonka)
-    before_state = gonka.smart(deal, {"state": {}})
-    before = {
-        "deal": gonka.bank_balance(deal),
-        "host": gonka.bank_balance(host),
-        "buyer": gonka.bank_balance(buyer),
+    return {
+        "caller": caller,
+        "caller_before": gonka.bank_balance(caller),
+        "epoch_before": epoch_observation(gonka),
+        "state_before": gonka.smart(deal, {"state": {}}),
+        "bank_before": {
+            "deal": gonka.bank_balance(deal),
+            "host": gonka.bank_balance(host),
+            "buyer": gonka.bank_balance(buyer),
+        },
+        "foreign_before": gonka.cw20_balance(foreign, deal) if isinstance(foreign, str) else None,
     }
-    foreign = context.get("contracts", {}).get("foreign_cw20")
-    foreign_before = gonka.cw20_balance(foreign, deal) if isinstance(foreign, str) else None
-    if before["deal"] <= 0:
-        if is_completed_release_noop(before_state, before["deal"]):
-            tx = gonka.execute(
-                DEFAULT_NODE, "genesis", deal, {"release_unlocked_gnk": {}}, gas="auto"
-            )
-            epoch_after = epoch_observation(gonka)
-            epoch_bracket = assert_tx_epoch_bracket(tx, epoch_before, epoch_after)
-            assert_no_bank_transfer_involving(tx, deal)
-            after_state = gonka.smart(deal, {"state": {}})
-            after = {
-                "deal": gonka.bank_balance(deal),
-                "host": gonka.bank_balance(host),
-                "buyer": gonka.bank_balance(buyer),
-            }
-            foreign_after = (
-                gonka.cw20_balance(foreign, deal) if isinstance(foreign, str) else None
-            )
-            if after_state != before_state or after != before or foreign_after != foreign_before:
-                raise AcceptanceError("terminal release repeat changed state or balances")
-            append_named_phase(context, args.name, {
-                    "name": "release_repeat_noop",
-                    "level": "live_network",
-                    "tx": filtered_tx(tx),
-                    "caller": caller,
-                    "caller_native_fee_delta": gonka.bank_balance(caller) - caller_before,
-                    "epoch_bracket": epoch_bracket,
-                    "before_state": before_state,
-                    "after_state": after_state,
-                    "before": before,
-                    "after": after,
-                    "foreign_cw20_before": foreign_before,
-                    "foreign_cw20_after": foreign_after,
-                    "expected": {"native_transfers": 0, "state_unchanged": True},
-                })
-            write_object(path, context)
-            print(compact_json({"scenario": args.name, "release_repeat": "no-op"}))
-            return
-        raise AcceptanceError("scenario Deal has no spendable ngonka")
-    tx = gonka.execute(DEFAULT_NODE, "genesis", deal, {"release_unlocked_gnk": {}}, gas="auto")
+
+
+def execute_gnk_release(gonka: DockerGonka, deal: str) -> dict[str, Any]:
+    """The single ExecuteMsg every GNK release uses."""
+    return gonka.execute(DEFAULT_NODE, "genesis", deal, GNK_RELEASE_MSG, gas="auto")
+
+
+def close_gnk_release(
+    gonka: DockerGonka,
+    deal: str,
+    host: str,
+    buyer: str,
+    foreign: str | None,
+    opening: Mapping[str, Any],
+    tx: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assert one GNK release and build the receipt every release command writes.
+
+    Both `release` and `release-scenario` record the same evidence: the
+    included transaction, the epoch bracket measured around it, the caller and
+    the fee it paid, both sides of the Deal/Host/Buyer balances, the foreign
+    CW20 that must not move and the independently recomputed release oracle.
+    One shape means one validator can check every release the harness writes.
+    """
+    before_state = opening["state_before"]
+    before = opening["bank_before"]
     epoch_after = epoch_observation(gonka)
-    epoch_bracket = assert_tx_epoch_bracket(tx, epoch_before, epoch_after)
+    epoch_bracket = assert_tx_epoch_bracket(tx, opening["epoch_before"], epoch_after)
     after_state = gonka.smart(deal, {"state": {}})
     after = {
         "deal": gonka.bank_balance(deal),
@@ -3302,29 +3652,123 @@ def release_scenario(args: argparse.Namespace) -> None:
         or address_delta != before["deal"]
         or buyer_delta + host_delta != before["deal"]
     ):
-        raise AcceptanceError("scenario GNK release does not conserve spendable balance")
-    if foreign_after != foreign_before:
-        raise AcceptanceError("scenario GNK release spent foreign CW20")
-    append_named_phase(context, args.name, {
-            "name": "release",
-            "tx": filtered_tx(tx),
-            "caller": caller,
-            "caller_native_fee_delta": gonka.bank_balance(caller) - caller_before,
-            "epoch_bracket": epoch_bracket,
-            "state_before": before_state,
-            "state_after": after_state,
-            "bank_before": before,
-            "bank_after": after,
-            "foreign_cw20_before": foreign_before,
-            "foreign_cw20_after": foreign_after,
-            "expected": expected,
-            "actual": {
-                "buyer_delta": buyer_delta,
-                "host_delta": host_delta,
-                "address_delta": address_delta,
-                "coincident_recipients": coincident_recipients,
-            },
-        })
+        raise AcceptanceError("GNK release does not conserve the complete spendable balance")
+    if foreign_after != opening["foreign_before"]:
+        raise AcceptanceError("GNK release spent foreign CW20")
+    return {
+        "name": "release",
+        "recorded_at_utc": utc_now(),
+        "tx": filtered_tx(tx),
+        "caller": opening["caller"],
+        "caller_native_fee_delta": gonka.bank_balance(opening["caller"])
+        - opening["caller_before"],
+        "epoch_bracket": epoch_bracket,
+        "state_before": before_state,
+        "state_after": after_state,
+        "bank_before": before,
+        "bank_after": after,
+        "foreign_cw20_before": opening["foreign_before"],
+        "foreign_cw20_after": foreign_after,
+        "expected": expected,
+        "actual": {
+            "buyer_delta": buyer_delta,
+            "host_delta": host_delta,
+            "address_delta": address_delta,
+            "coincident_recipients": coincident_recipients,
+            "released_total": require_uint(
+                after_state.get("released_total_ngonka"), "released total after"
+            ),
+            "buyer_released": require_uint(
+                after_state.get("buyer_released_ngonka"), "buyer released after"
+            ),
+            "host_released": require_uint(
+                after_state.get("host_released_ngonka"), "host released after"
+            ),
+        },
+    }
+
+
+def is_completed_release_noop(state: Mapping[str, Any], deal_balance: int) -> bool:
+    return state.get("status") == "completed" and deal_balance == 0
+
+
+def release_scenario(args: argparse.Namespace) -> None:
+    path = Path(args.context)
+    context = load_object(path)
+    scenario = named_scenario_or_bootstrap(context, args.name)
+    gonka = DockerGonka(Runner(), context["chain"]["chain_id"])
+    assert_chain(gonka)
+    deal = scenario["contracts"]["deal"]
+    host = scenario["accounts"]["host"]
+    buyer = scenario["accounts"].get("buyer") or context["accounts"]["buyer"]
+    foreign = context.get("contracts", {}).get("foreign_cw20")
+    opening = open_gnk_release(gonka, deal, host, buyer, foreign)
+    before_state = opening["state_before"]
+    before = opening["bank_before"]
+    foreign_before = opening["foreign_before"]
+    if before["deal"] <= 0:
+        if is_completed_release_noop(before_state, before["deal"]):
+            attempt = gonka.tx_attempt(
+                DEFAULT_NODE,
+                "genesis",
+                "wasm",
+                "execute",
+                deal,
+                compact_json(GNK_RELEASE_MSG),
+                gas="2000000",
+            )
+            receipt: Mapping[str, Any] = attempt
+            if attempt.get("layer") == "deliver_tx" and attempt.get("tx_hash"):
+                receipt = gonka.wait_tx_any(str(attempt["tx_hash"]))
+            terminal_rejection = assert_terminal_nothing_to_release(attempt)
+            epoch_after = epoch_observation(gonka)
+            epoch_bracket = assert_tx_epoch_bracket(
+                receipt, opening["epoch_before"], epoch_after
+            )
+            assert_no_bank_transfer_involving(receipt, deal)
+            after_state = gonka.smart(deal, {"state": {}})
+            after = {
+                "deal": gonka.bank_balance(deal),
+                "host": gonka.bank_balance(host),
+                "buyer": gonka.bank_balance(buyer),
+            }
+            foreign_after = (
+                gonka.cw20_balance(foreign, deal) if isinstance(foreign, str) else None
+            )
+            if after_state != before_state or after != before or foreign_after != foreign_before:
+                raise AcceptanceError("terminal release repeat changed state or balances")
+            append_named_phase(context, args.name, {
+                    "name": "release_repeat_rejected",
+                    "level": "live_network",
+                    "deal": deal,
+                    "tx": dict(attempt),
+                    "terminal_rejection": terminal_rejection,
+                    "caller": opening["caller"],
+                    "caller_native_fee_delta": gonka.bank_balance(opening["caller"])
+                    - opening["caller_before"],
+                    "epoch_bracket": epoch_bracket,
+                    "before_state": before_state,
+                    "after_state": after_state,
+                    "before": before,
+                    "after": after,
+                    "foreign_cw20_before": foreign_before,
+                    "foreign_cw20_after": foreign_after,
+                    "expected": {
+                        "contract_error": "NothingToRelease",
+                        "native_transfers": 0,
+                        "state_unchanged": True,
+                    },
+                })
+            write_object(path, context)
+            print(compact_json({"scenario": args.name, "release_repeat": "rejected"}))
+            return
+        raise AcceptanceError("scenario Deal has no spendable ngonka")
+    tx = execute_gnk_release(gonka, deal)
+    append_named_phase(
+        context,
+        args.name,
+        close_gnk_release(gonka, deal, host, buyer, foreign, opening, tx),
+    )
     write_object(path, context)
     print(compact_json({"scenario": args.name, "released": before["deal"]}))
 
@@ -3399,6 +3843,9 @@ def bank_release_rollback_scenario(args: argparse.Namespace) -> None:
             "expected": {
                 "failure_category": "bank_send_restriction",
                 "outgoing_transfer_index": args.expected_send_index,
+                "outgoing_transfer_index_basis": (
+                    "release_oracle_expected_position; DeliverTx raw_log proves restriction class, not message index"
+                ),
                 "allowed_earlier_recipient": args.allowed_earlier_recipient,
                 "rejected_recipient": args.rejected_recipient,
                 "live_exemption": live_exemption,
@@ -3526,6 +3973,9 @@ def bank_release_retry_scenario(args: argparse.Namespace) -> None:
             "repeat": repeat,
             "expected": {
                 "outgoing_transfer_index": args.expected_send_index,
+                "outgoing_transfer_index_basis": fault.get("expected", {}).get(
+                    "outgoing_transfer_index_basis"
+                ),
                 "rejected_recipient": args.rejected_recipient,
                 "fault_off_before_retry": True,
                 "exact_release_oracle": True,
@@ -3534,6 +3984,20 @@ def bank_release_retry_scenario(args: argparse.Namespace) -> None:
         })
     write_object(path, refreshed)
     print(compact_json({"scenario": args.name, "native_bank_retry": "pass"}))
+
+
+def assert_scenario_repeat_roles(
+    state: Mapping[str, Any], scenario: Mapping[str, Any], context: Mapping[str, Any], caller: str
+) -> None:
+    """Keep the repeat caller independent without rejecting a valid HostOnly alias."""
+    host = scenario["accounts"]["host"]
+    buyer = scenario["accounts"].get("buyer") or context["accounts"]["buyer"]
+    fee_recipient = scenario["accounts"]["fee_recipient"]
+    financial_roles = {host, buyer, fee_recipient}
+    if caller in financial_roles:
+        raise AcceptanceError("scenario release repeat caller must be independent of financial roles")
+    if normalize_release_policy(state.get("gnk_release_policy")) != "host_only" and len(financial_roles) != 3:
+        raise AcceptanceError("proportional scenario release repeat requires independent financial roles")
 
 
 def scenario_release_repeat(args: argparse.Namespace) -> None:
@@ -3547,15 +4011,8 @@ def scenario_release_repeat(args: argparse.Namespace) -> None:
     caller = context["accounts"]["inactive_host"]
     caller_key = context["key_names"]["inactive_host"]
     caller_node = context["key_names"]["inactive_host_node"]
-    roles = {
-        scenario["accounts"]["host"],
-        scenario["accounts"].get("buyer") or context["accounts"]["buyer"],
-        scenario["accounts"]["fee_recipient"],
-        caller,
-    }
-    if len(roles) != 4:
-        raise AcceptanceError("scenario release repeat requires independent financial roles")
     before = scenario_financial_snapshot(gonka, context, scenario)
+    assert_scenario_repeat_roles(before["state"], scenario, context, caller)
     if before["bank_ngonka"]["deal"] != 0:
         raise AcceptanceError("scenario release retry left spendable GNK on the selected Deal")
     if before["state"].get("status") not in {"completed", "refunded"}:
@@ -3594,6 +4051,76 @@ def scenario_release_repeat(args: argparse.Namespace) -> None:
                 "arbitrary_error_accepted": False,
             },
         })
+    write_object(path, context)
+
+
+def assert_early_release_unavailable(args: argparse.Namespace) -> None:
+    """Prove a positive no-sale claim has no spendable GNK before a tranche unlocks."""
+    path = Path(args.context)
+    context = load_object(path)
+    scenario = scenario_record(context, args.name)
+    gonka = DockerGonka(Runner(), context["chain"]["chain_id"])
+    assert_chain(gonka)
+    deal = scenario["contracts"]["deal"]
+    before = scenario_financial_snapshot(gonka, context, scenario)
+    if before["state"].get("status") != "releasing":
+        raise AcceptanceError("early Release probe requires a settled Releasing Deal")
+    if before["state"].get("buyer") is not None:
+        raise AcceptanceError("early Release probe requires Buyer absence")
+    if before["bank_ngonka"].get("deal") != 0:
+        raise AcceptanceError("early Release probe requires no spendable GNK before vesting unlock")
+    # Release is permissionless. The scenario Host is deliberately offline;
+    # use the active bootstrap Buyer key, whose balance is already tracked.
+    caller_node = context["key_names"]["buyer_node"]
+    caller_key = context["key_names"]["buyer"]
+    caller = gonka.key_address(caller_node, caller_key)
+    if caller != context["accounts"]["buyer"]:
+        raise AcceptanceError("early Release caller differs from the tracked bootstrap Buyer")
+    caller_roles = {
+        role for role, address in {
+            "host": scenario["accounts"]["host"],
+            "buyer": scenario["accounts"].get("buyer") or context["accounts"]["buyer"],
+            "fee_recipient": scenario["accounts"]["fee_recipient"],
+            "deal": deal,
+        }.items() if address == caller
+    }
+    if not caller_roles:
+        raise AcceptanceError("early Release caller is absent from the tracked bank snapshot")
+    caller_before = gonka.bank_balance(caller)
+    attempt = gonka.tx_attempt(
+        caller_node,
+        caller_key,
+        "wasm",
+        "execute",
+        deal,
+        compact_json({"release_unlocked_gnk": {}}),
+        gas="2000000",
+    )
+    proof = assert_terminal_nothing_to_release(attempt)
+    after = scenario_financial_snapshot(gonka, context, scenario)
+    caller_after = gonka.bank_balance(caller)
+    if after["bank_ngonka"].get("deal") != 0:
+        raise AcceptanceError("early Release probe moved native funds into or out of the Deal")
+    fee_deltas = assert_snapshot_unchanged_except_fee_payer(before, after, caller_roles)
+    if any(caller_after - caller_before != fee_deltas.get(role) for role in caller_roles):
+        raise AcceptanceError("early Release fee does not match the caller snapshot delta")
+    append_named_phase(context, args.name, {
+        "name": "early_release_rejected",
+        "level": "live_network",
+        "deal": deal,
+        "caller": caller,
+        "before": before,
+        "after": after,
+        "fee_payer_deltas_ngonka": fee_deltas,
+        "attempt": attempt,
+        "proof": proof,
+        "expected": {
+            "contract_error": "NothingToRelease",
+            "deal_balance_ngonka": 0,
+            "buyer": None,
+            "state_unchanged": True,
+        },
+    })
     write_object(path, context)
 
 
@@ -4293,8 +4820,9 @@ def vesting_epoch_amounts(response: Mapping[str, Any]) -> list[dict[str, int]]:
     return normalized
 
 
-def current_epoch(gonka: DockerGonka) -> int:
-    response = gonka.query_json("inference", "get-current-epoch")
+def current_epoch(gonka: DockerGonka, *, height: int | None = None) -> int:
+    flags = ("--height", str(height)) if height is not None else ()
+    response = gonka.query_json("inference", "get-current-epoch", *flags)
     return require_uint(response.get("epoch"), "current epoch")
 
 
@@ -4339,34 +4867,182 @@ def assert_tx_epoch_bracket(
     }
 
 
-def snapshot_vesting_scenario(args: argparse.Namespace) -> None:
-    path = Path(args.context)
-    context = load_object(path)
-    scenario = scenario_record(context, args.name)
-    gonka = DockerGonka(Runner(), context["chain"]["chain_id"])
+def assert_vesting_schedule_recipient(response: Mapping[str, Any], recipient: str) -> None:
+    # An explicit null is the native response for no schedule (including after
+    # the final unlock). A present schedule must identify the queried account.
+    if "vesting_schedule" not in response:
+        raise AcceptanceError("vesting response lacks its schedule")
+    schedule = response["vesting_schedule"]
+    if schedule is not None and (
+        not isinstance(schedule, Mapping) or schedule.get("participant_address") != recipient
+    ):
+        raise AcceptanceError("vesting schedule participant differs from the Deal")
+
+
+def native_unlock_amounts(value: Any) -> dict[str, int]:
+    """Parse sdk.Coins.String() without treating malformed totals as evidence."""
+    if not isinstance(value, str) or not value:
+        raise AcceptanceError("invalid native unlock amount")
+    amounts: dict[str, int] = {}
+    for coin in value.split(","):
+        match = re.fullmatch(r"([1-9][0-9]*)([a-zA-Z][a-zA-Z0-9/:._-]{2,127})", coin)
+        if match is None or match[2] in amounts:
+            raise AcceptanceError("invalid native unlock amount")
+        try:
+            amounts[match[2]] = int(match[1])
+        except ValueError as exc:
+            raise AcceptanceError("invalid native unlock amount") from exc
+    return amounts
+
+
+def vesting_observation(gonka: DockerGonka, deal: str) -> dict[str, Any]:
+    """Bind schedule, epoch and balance to the event scan's exact upper height."""
     status = assert_chain(gonka)
     sync = status.get("sync_info")
     if not isinstance(sync, Mapping):
         sync = status.get("SyncInfo")
     if not isinstance(sync, Mapping):
         raise AcceptanceError(f"status lacks sync info: {status}")
-    deal = scenario["contracts"]["deal"]
-    schedule = gonka.query_json("streamvesting", "vesting-schedule", deal)
+    height = require_uint(sync.get("latest_block_height"), "vesting observation height")
+    # Cosmos treats height zero as latest, which would silently lose the binding.
+    if height == 0:
+        raise AcceptanceError("vesting observation requires a committed block")
+    schedule = gonka.query_json("streamvesting", "vesting-schedule", deal, "--height", str(height))
+    assert_vesting_schedule_recipient(schedule, deal)
+    return {
+        "height": height,
+        "schedule": schedule,
+        "epoch": current_epoch(gonka, height=height),
+        "bank_balance_ngonka": gonka.bank_balance(deal, height=height),
+    }
+
+
+def snapshot_vesting_scenario(args: argparse.Namespace) -> None:
+    path = Path(args.context)
+    context = load_object(path)
+    scenario = scenario_record(context, args.name)
+    gonka = DockerGonka(Runner(), context["chain"]["chain_id"])
+    observation = vesting_observation(gonka, scenario["contracts"]["deal"])
+    schedule = observation["schedule"]
     normalized = vesting_epoch_amounts(schedule)
     if args.require_non_empty and not normalized:
         raise AcceptanceError("vesting snapshot requires at least one old tranche")
     phase = {
         "name": "vesting_snapshot",
         "label": args.label,
-        "epoch": current_epoch(gonka),
-        "height": require_uint(sync.get("latest_block_height"), "vesting snapshot height"),
-        "schedule": schedule,
+        **observation,
         "normalized_epoch_amounts": normalized,
         "required_non_empty": args.require_non_empty,
     }
     context["scenarios"][args.name]["phases"].append(phase)
     write_object(path, context)
     print(compact_json({"scenario": args.name, "label": args.label, "status": "pass"}))
+
+
+def vesting_transition_events(
+    gonka: DockerGonka, before_height: int, after_height: int, recipient: str
+) -> list[dict[str, Any]]:
+    """Preserve native transfer_with_vesting/unlock_tokens consensus order."""
+    if before_height <= 0 or after_height < before_height:
+        raise AcceptanceError("invalid vesting observation heights")
+    found: list[dict[str, Any]] = []
+    for height in range(before_height + 1, after_height + 1):
+        result = gonka.block_results(height).get("result")
+        if not isinstance(result, Mapping):
+            raise AcceptanceError(f"block results at height {height} lack result")
+        # FinalizeBlock replaces BeginBlock/EndBlock; combining both layouts
+        # would duplicate events and fabricate unlock eligibility.
+        if result.get("finalize_block_events") is not None:
+            if result.get("begin_block_events") or result.get("end_block_events"):
+                raise AcceptanceError("ambiguous block event layout")
+            events = result["finalize_block_events"]
+        else:
+            begin = result.get("begin_block_events") or []
+            end = result.get("end_block_events") or []
+            if not isinstance(begin, list) or not isinstance(end, list):
+                raise AcceptanceError("malformed block events")
+            events = begin + end
+        if not isinstance(events, list):
+            raise AcceptanceError("malformed block events")
+        for index, event in enumerate(events):
+            if not isinstance(event, Mapping):
+                raise AcceptanceError("malformed block event")
+            kind = event.get("type")
+            if kind not in ("transfer_with_vesting", "unlock_tokens"):
+                continue
+            attributes = event.get("attributes")
+            if not isinstance(attributes, list):
+                raise AcceptanceError("malformed vesting event attributes")
+            values: dict[str, Any] = {}
+            for attribute in attributes:
+                if not isinstance(attribute, Mapping) or not isinstance(attribute.get("key"), str):
+                    raise AcceptanceError("malformed vesting event attribute")
+                key = attribute["key"]
+                if key in values:
+                    raise AcceptanceError("duplicate vesting event attribute")
+                values[key] = attribute.get("value")
+            if kind == "transfer_with_vesting" and values.get("recipient") != recipient:
+                continue
+            found.append({"height": height, "event_index": index, "type": kind, "attributes": attributes})
+    return found
+
+
+def reconcile_vesting_addition(
+    before: list[dict[str, int]], after: list[dict[str, int]],
+    addition: list[dict[str, int]], bank_delta: int,
+    events: list[dict[str, Any]], recipient: str, sender: str,
+) -> tuple[int, int]:
+    """Replay the chain's order instead of moving every unlock after the gift."""
+    schedule = [dict(epoch) for epoch in before]
+    released = released_count = additions = 0
+    previous = (0, -1)
+    unlock_heights: set[int] = set()
+    for event in events:
+        height = require_uint(event.get("height"), "vesting event height")
+        index = require_uint(event.get("event_index"), "vesting event index")
+        if height == 0 or (height, index) <= previous:
+            raise AcceptanceError("vesting events are not in consensus order")
+        previous = (height, index)
+        values = {item["key"]: item["value"] for item in event["attributes"]}
+        if event["type"] == "transfer_with_vesting":
+            additions += 1
+            amount = sum(epoch.get(DEFAULT_DENOM, 0) for epoch in addition)
+            if (
+                additions != 1 or values.get("recipient") != recipient
+                or values.get("sender") != sender
+                or values.get("amount") != f"{amount}{DEFAULT_DENOM}"
+                or require_uint(values.get("vesting_epochs"), "vesting event epochs") != len(addition)
+            ):
+                raise AcceptanceError("vesting addition event does not match the requested gift")
+            while len(schedule) < len(addition):
+                schedule.append({})
+            for index, epoch in enumerate(addition):
+                for denom, amount in epoch.items():
+                    schedule[index][denom] = schedule[index].get(denom, 0) + amount
+                schedule[index] = {denom: amount for denom, amount in schedule[index].items() if amount}
+        elif event["type"] == "unlock_tokens":
+            unlocked_amounts = native_unlock_amounts(values.get("unlocked_amount"))
+            unlocked = require_uint(values.get("participants_unlocked"), "participants unlocked")
+            processed = require_uint(values.get("participants_processed"), "participants processed")
+            if (
+                height in unlock_heights or unlocked == 0 or processed < unlocked
+            ):
+                raise AcceptanceError("invalid or duplicate native unlock event")
+            unlock_heights.add(height)
+            if schedule:
+                if any(unlocked_amounts.get(denom, 0) < amount for denom, amount in schedule[0].items()):
+                    raise AcceptanceError("native unlock amount does not cover the Deal tranche")
+                released += schedule.pop(0).get(DEFAULT_DENOM, 0)
+                released_count += 1
+        else:
+            raise AcceptanceError("unknown vesting transition event")
+    if additions != 1 or schedule != after or released != bank_delta:
+        raise AcceptanceError(
+            "vesting addition cannot be reconciled with ordered events and bank delta: "
+            f"additions={additions}, replayed_schedule={schedule}, observed_schedule={after}, "
+            f"released={released}, bank_delta={bank_delta}"
+        )
+    return released_count, released
 
 
 def verify_vesting_addition_scenario(args: argparse.Namespace) -> None:
@@ -4386,15 +5062,18 @@ def verify_vesting_addition_scenario(args: argparse.Namespace) -> None:
         )
     before_phase = snapshots[0]
     gonka = DockerGonka(Runner(), context["chain"]["chain_id"])
-    assert_chain(gonka)
     deal = scenario["contracts"]["deal"]
-    after_schedule = gonka.query_json("streamvesting", "vesting-schedule", deal)
-    after_epoch = current_epoch(gonka)
-    if after_epoch != require_uint(before_phase.get("epoch"), "snapshot epoch"):
+    observation = vesting_observation(gonka, deal)
+    after_height = observation["height"]
+    after_schedule = observation["schedule"]
+    after_epoch = observation["epoch"]
+    before_epoch = require_uint(before_phase.get("epoch"), "snapshot epoch")
+    if after_epoch < before_epoch:
         raise AcceptanceError(
-            "vesting addition crossed an epoch boundary; old-tranche position is ambiguous"
+            "vesting addition observation epoch moved backwards"
         )
 
+    assert_vesting_schedule_recipient(before_phase["schedule"], deal)
     before = vesting_epoch_amounts(before_phase["schedule"])
     if not before and not args.allow_empty_before:
         raise AcceptanceError("vesting addition proof requires a non-empty old schedule")
@@ -4404,38 +5083,67 @@ def verify_vesting_addition_scenario(args: argparse.Namespace) -> None:
         {DEFAULT_DENOM: quotient + (remainder if index == 0 else 0)}
         for index in range(args.vesting_epochs)
     ]
-    expected_length = max(len(before), len(addition))
-    expected: list[dict[str, int]] = []
-    for index in range(expected_length):
-        combined: dict[str, int] = {}
-        denoms = set(before[index] if index < len(before) else {}) | set(
-            addition[index] if index < len(addition) else {}
-        )
-        for denom in denoms:
-            combined[denom] = (
-                (before[index].get(denom, 0) if index < len(before) else 0)
-                + (addition[index].get(denom, 0) if index < len(addition) else 0)
-            )
-        expected.append({denom: amount for denom, amount in combined.items() if amount})
-    if after != expected:
-        raise AcceptanceError(
-            "new vesting receipt shifted or changed old tranches: "
-            + compact_json({"before": before, "addition": addition, "expected": expected, "after": after})
-        )
-    if sum(epoch.get(DEFAULT_DENOM, 0) for epoch in after) - sum(
-        epoch.get(DEFAULT_DENOM, 0) for epoch in before
-    ) != args.amount:
+    before_bank = require_uint(
+        before_phase.get("bank_balance_ngonka"), "snapshot bank balance"
+    )
+    after_bank = observation["bank_balance_ngonka"]
+    bank_delta = after_bank - before_bank
+    before_height = require_uint(before_phase.get("height"), "snapshot height")
+    events = vesting_transition_events(gonka, before_height, after_height, deal)
+    proposal = gonka.query_json("gov", "proposal", args.proposal_id, "--height", str(after_height))
+    proposal_record = proposal.get("proposal")
+    queried_proposal_id = require_uint(args.proposal_id, "queried proposal ID")
+    recorded_proposal_id = require_uint(
+        proposal_record.get("id") if isinstance(proposal_record, Mapping) else None,
+        "proposal response ID",
+    )
+    if queried_proposal_id == 0 or recorded_proposal_id != queried_proposal_id:
+        raise AcceptanceError("proposal ID does not match the queried gift proposal")
+    status = proposal_record.get("status") if isinstance(proposal_record, Mapping) else None
+    if status != "PROPOSAL_STATUS_PASSED":
+        raise AcceptanceError(f"vesting governance proposal did not pass: {proposal}")
+    messages = proposal_record.get("messages")
+    if not isinstance(messages, list) or len(messages) != 1 or not isinstance(messages[0], Mapping):
+        raise AcceptanceError("vesting proposal must contain exactly one transfer message")
+    message = messages[0]
+    transfer = message.get("value")
+    if message.get("type") != "inference/x/streamvesting/MsgTransferWithVesting" or not isinstance(transfer, Mapping):
+        raise AcceptanceError("vesting proposal message is not MsgTransferWithVesting")
+    sender = transfer.get("sender")
+    if not isinstance(sender, str) or not sender:
+        raise AcceptanceError("vesting proposal lacks its sender")
+    if (
+        transfer.get("recipient") != deal
+        or transfer.get("amount") != [{"denom": DEFAULT_DENOM, "amount": str(args.amount)}]
+        or require_uint(transfer.get("vesting_epochs"), "proposal vesting epochs") != args.vesting_epochs
+    ):
+        raise AcceptanceError("vesting proposal does not match the requested gift")
+    unlock_events = [event for event in events if event["type"] == "unlock_tokens"]
+    eligible_prefix_count = len(unlock_events)
+    released_count, released = reconcile_vesting_addition(
+        before, after, addition, bank_delta, events, deal, sender
+    )
+    if (
+        sum(epoch.get(DEFAULT_DENOM, 0) for epoch in after)
+        + released
+        - sum(epoch.get(DEFAULT_DENOM, 0) for epoch in before)
+        != args.amount
+    ):
         raise AcceptanceError("vesting addition does not conserve the injected amount")
 
     funding = gonka.wait_tx(args.fund_tx_hash)
-    proposal = gonka.query_json("gov", "proposal", args.proposal_id)
-    proposal_record = proposal.get("proposal")
-    status = proposal_record.get("status") if isinstance(proposal_record, Mapping) else None
-    if "PASSED" not in str(status).upper():
-        raise AcceptanceError(f"vesting governance proposal did not pass: {proposal}")
+    if tx_hash(funding).upper() != args.fund_tx_hash.upper():
+        raise AcceptanceError("funding transaction hash does not match the queried hash")
+    funding_sender = one_event_value(funding, {"sender"}, "vesting funding sender")
+    assert_exact_bank_transfer_event(
+        funding, funding_sender, sender, args.amount, DEFAULT_DENOM
+    )
     context["scenarios"][args.name]["phases"].append(
         {
             "name": "vesting_addition",
+            "vesting_event_model": "ordered/2",
+            "recipient": deal,
+            "vesting_events": events,
             "level": "live_network",
             "epoch": after_epoch,
             "amount_ngonka": args.amount,
@@ -4445,9 +5153,19 @@ def verify_vesting_addition_scenario(args: argparse.Namespace) -> None:
             "proposal": proposal,
             "before": before_phase["schedule"],
             "addition_by_epoch": addition,
-            "expected": expected,
+            "expected": after,
             "after": after_schedule,
-            "assertion": "subtracting the new schedule leaves every old tranche unchanged",
+            "before_bank_ngonka": before_bank,
+            "after_bank_ngonka": after_bank,
+            "released_prefix_count": released_count,
+            "released_prefix_ngonka": released,
+            "before_epoch": before_epoch,
+            "after_epoch": after_epoch,
+            "before_height": before_height,
+            "after_height": after_height,
+            "unlock_events": unlock_events,
+            "eligible_prefix_count": eligible_prefix_count,
+            "assertion": "ordered native vesting events reproduce the remaining schedule and bank payout",
             "allow_empty_before": args.allow_empty_before,
         }
     )
@@ -4520,6 +5238,13 @@ def verify_factory_isolation(args: argparse.Namespace) -> None:
     )
     if duplicate["code"] == 0:
         raise AcceptanceError("Factory allowed a duplicate Host/E Deal")
+    if (
+        duplicate.get("layer") != "deliver_tx"
+        or duplicate.get("codespace") != "wasm"
+        or not duplicate.get("tx_hash")
+        or int(duplicate.get("height") or 0) <= 0
+    ):
+        raise AcceptanceError("Factory duplicate rejection was not included in DeliverTx")
     after = deal_snapshot()
     listed_after = gonka.smart(factory, {"list_deals": {"start_after": None, "limit": 100}})
     if after != before or listed_after != listed_before:
@@ -4565,6 +5290,34 @@ def lock(args: argparse.Namespace) -> None:
         },
     )
     print(compact_json({"status": "locked", "tx_hash": tx_hash(tx)}))
+
+
+def assert_prepared_claim_resume(
+    prepared_claim: Mapping[str, Any],
+    before: Mapping[str, Any],
+    current_deal_config: Mapping[str, Any],
+    current_summary: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Bind a resumed settlement to the exact claim evidence and unchanged Deal state."""
+    claim_tx = prepared_claim.get("claim_tx")
+    summary = prepared_claim.get("summary")
+    if not isinstance(claim_tx, Mapping) or not isinstance(summary, Mapping):
+        raise AcceptanceError("prepared claim evidence is incomplete")
+    recorded_before = prepared_claim.get("before")
+    if not isinstance(recorded_before, Mapping):
+        raise AcceptanceError("prepared claim evidence lacks its pre-claim snapshot")
+    # ClaimRewards must change Deal-native bank/vesting. Contract state and the
+    # settlement CW20 ledger, however, must remain untouched until SettleClaim.
+    for field in ("deal_state", "cw20"):
+        if recorded_before.get(field) != before.get(field):
+            raise AcceptanceError(
+                f"claim resume {field} differs from the prepared claim"
+            )
+    if prepared_claim.get("deal_config") != current_deal_config:
+        raise AcceptanceError("claim resume Deal config differs from the prepared claim")
+    if current_summary != summary:
+        raise AcceptanceError("claim resume native summary differs from prepared evidence")
+    return claim_tx, summary, recorded_before
 
 
 def claim_settle(args: argparse.Namespace) -> None:
@@ -4628,24 +5381,61 @@ def claim_settle(args: argparse.Namespace) -> None:
         raise AcceptanceError(
             "settlement pre-state does not prove the exact locked funded Deal"
         )
-    claim_tx = gonka.tx(
-        args.host_node,
-        keys["host"],
-        "inference",
-        "claim-rewards",
-        str(args.reward_seed),
-        str(args.reward_epoch),
-        # Match Testermint's ApplicationCLI: simulation of ClaimRewards lacks
-        # historical block hashes on this pinned Gonka build and can panic,
-        # while the actual transaction path has the required context.
-        gas="2000000",
-    )
-    summary = gonka.query_json(
-        "inference",
-        "show-epoch-performance-summary-by-participant",
-        str(target_epoch),
-        host,
-    )
+    if getattr(args, "resume_claim", False):
+        prepared = [
+            phase for phase in context.get("phases", [])
+            if phase.get("name") == "claim_prepared"
+        ]
+        if len(prepared) != 1:
+            raise AcceptanceError("claim resume requires exactly one prepared claim phase")
+        prepared_claim = prepared[0]
+        current_summary = gonka.query_json(
+            "inference",
+            "show-epoch-performance-summary-by-participant",
+            str(target_epoch),
+            host,
+        )
+        claim_tx, summary, before = assert_prepared_claim_resume(
+            prepared_claim, before, current_deal_config, current_summary
+        )
+    else:
+        claim_tx = gonka.tx(
+            args.host_node,
+            keys["host"],
+            "inference",
+            "claim-rewards",
+            str(args.reward_seed),
+            str(args.reward_epoch),
+            # Match Testermint's ApplicationCLI: simulation of ClaimRewards lacks
+            # historical block hashes on this pinned Gonka build and can panic,
+            # while the actual transaction path has the required context.
+            gas="2000000",
+        )
+        summary = gonka.query_json(
+            "inference",
+            "show-epoch-performance-summary-by-participant",
+            str(target_epoch),
+            host,
+        )
+        if getattr(args, "claim_only", False):
+            native = summary.get("epochPerformanceSummary")
+            if not isinstance(native, Mapping) or native.get("claimed") is not True:
+                raise AcceptanceError(f"prepared native claim is not authoritative: {summary}")
+            if (
+                require_uint(native.get("epoch_index"), "native summary epoch") != target_epoch
+                or native.get("participant_id") != host
+            ):
+                raise AcceptanceError("prepared native claim summary identity mismatch")
+            append_phase(path, {
+                "name": "claim_prepared",
+                "recorded_at_utc": utc_now(),
+                "claim_tx": filtered_tx(claim_tx),
+                "summary": summary,
+                "deal_config": current_deal_config,
+                "before": before,
+            })
+            print(compact_json({"status": "claim_prepared", "tx_hash": tx_hash(claim_tx)}))
+            return
     settle_tx = gonka.execute(
         DEFAULT_NODE, "genesis", deal, {"settle_claim": {}}, gas="auto"
     )
@@ -4826,57 +5616,19 @@ def release(args: argparse.Namespace) -> None:
     gonka = DockerGonka(Runner(), context["chain"]["chain_id"])
     assert_chain(gonka)
     deal = context["contracts"]["deal"]
-    if context["accounts"]["host"] == context["accounts"]["buyer"]:
+    host = context["accounts"]["host"]
+    buyer = context["accounts"]["buyer"]
+    if host == buyer:
         raise AcceptanceError("release evidence requires distinct Host and Buyer accounts")
-    before_state = gonka.smart(deal, {"state": {}})
-    before = {
-        "deal": gonka.bank_balance(deal),
-        "host": gonka.bank_balance(context["accounts"]["host"]),
-        "buyer": gonka.bank_balance(context["accounts"]["buyer"]),
-    }
-    if before["deal"] <= 0:
+    foreign = context.get("contracts", {}).get("foreign_cw20")
+    # The same receipt shape as release-scenario, so one validator covers both.
+    opening = open_gnk_release(gonka, deal, host, buyer, foreign)
+    available = opening["bank_before"]["deal"]
+    if available <= 0:
         raise AcceptanceError("Deal has no spendable ngonka; release predicate not reached")
-    tx = gonka.execute(
-        DEFAULT_NODE, "genesis", deal, {"release_unlocked_gnk": {}}, gas="auto"
-    )
-    after_state = gonka.smart(deal, {"state": {}})
-    after = {
-        "deal": gonka.bank_balance(deal),
-        "host": gonka.bank_balance(context["accounts"]["host"]),
-        "buyer": gonka.bank_balance(context["accounts"]["buyer"]),
-    }
-    buyer_delta = after["buyer"] - before["buyer"]
-    host_delta = after["host"] - before["host"]
-    if buyer_delta + host_delta != before["deal"] or after["deal"] != 0:
-        raise AcceptanceError("GNK release does not conserve the complete spendable balance")
-    oracle = assert_release_matches_oracle(
-        before_state,
-        after_state,
-        before["deal"],
-        buyer_delta,
-        host_delta,
-    )
-    append_phase(
-        path,
-        {
-            "name": "release",
-            "recorded_at_utc": utc_now(),
-            "tx": filtered_tx(tx),
-            "state_before": before_state,
-            "state_after": after_state,
-            "bank_before": before,
-            "bank_after": after,
-            "expected": oracle,
-            "actual": {
-                "buyer_delta": buyer_delta,
-                "host_delta": host_delta,
-                "released_total": int(after_state["released_total_ngonka"]),
-                "buyer_released": int(after_state["buyer_released_ngonka"]),
-                "host_released": int(after_state["host_released_ngonka"]),
-            },
-        },
-    )
-    print(compact_json({"released": before["deal"], "tx_hash": tx_hash(tx)}))
+    tx = execute_gnk_release(gonka, deal)
+    append_phase(path, close_gnk_release(gonka, deal, host, buyer, foreign, opening, tx))
+    print(compact_json({"released": available, "tx_hash": tx_hash(tx)}))
 
 
 def b3_foreign_native_release(args: argparse.Namespace) -> None:
@@ -5656,9 +6408,10 @@ def p0_probe(args: argparse.Namespace) -> None:
     if denied.returncode == 0:
         raise AcceptanceError(f"broad gRPC route unexpectedly allowed: {denied_path}")
     denial_text = (denied.stderr or denied.stdout).strip()
-    if denied_path not in denial_text:
+    expected_denial = f"'{denied_path}' path is not allowed from the contract"
+    if expected_denial not in denial_text:
         raise AcceptanceError(
-            "broad gRPC route failed without identifying the denied path"
+            "broad gRPC route failed without the expected allowlist denial"
         )
 
     append_phase(
@@ -5780,7 +6533,12 @@ def parser() -> argparse.ArgumentParser:
     verify_claimed_parser.add_argument("--context", required=True)
     verify_claimed_parser.add_argument("--name", required=True)
     verify_claimed_parser.add_argument("--require-positive", action="store_true")
-    verify_claimed_parser.add_argument("--wait-seconds", type=int, default=120)
+    # Auto-claim is submitted by the off-chain DAPI after the chain finalizes
+    # the epoch summary. Image rebuilds and a cold three-node network can make
+    # that asynchronous hand-off exceed two minutes without changing chain
+    # semantics, so keep the assertion strict but give the producer five
+    # minutes to publish the authoritative claimed=true record.
+    verify_claimed_parser.add_argument("--wait-seconds", type=int, default=300)
     verify_claimed_parser.set_defaults(handler=verify_claimed_scenario)
 
     verify_unclaimed_parser = commands.add_parser("verify-unclaimed-scenario")
@@ -5840,6 +6598,11 @@ def parser() -> argparse.ArgumentParser:
     scenario_repeat_parser.add_argument("--name", required=True)
     scenario_repeat_parser.add_argument("--gas", type=int, default=2_000_000)
     scenario_repeat_parser.set_defaults(handler=scenario_release_repeat)
+
+    early_release_parser = commands.add_parser("assert-early-release-unavailable")
+    early_release_parser.add_argument("--context", required=True)
+    early_release_parser.add_argument("--name", required=True)
+    early_release_parser.set_defaults(handler=assert_early_release_unavailable)
 
     gas_parser = commands.add_parser("gas-sweep-scenario")
     gas_parser.add_argument("--context", required=True)
@@ -5930,6 +6693,9 @@ def parser() -> argparse.ArgumentParser:
     settle_parser.add_argument("--reward-epoch", type=int, required=True)
     settle_parser.add_argument("--host-node", default=DEFAULT_HOST_NODE)
     settle_parser.add_argument("--fault-retry", action="store_true")
+    settle_mode = settle_parser.add_mutually_exclusive_group()
+    settle_mode.add_argument("--claim-only", action="store_true")
+    settle_mode.add_argument("--resume-claim", action="store_true")
     settle_parser.add_argument(
         "--cw20-fault-positions",
         type=lambda raw: [int(part) for part in raw.split(",") if part],
@@ -5971,43 +6737,80 @@ def parser() -> argparse.ArgumentParser:
     p0_parser.set_defaults(handler=p0_probe)
 
     run_parser = commands.add_parser("run-live")
-    from a8_query_faults import PHASES, run as run_query_faults
-    c_parser = commands.add_parser("c-phase")
-    c_parser.add_argument("--context", required=True)
-    c_parser.add_argument("--phase", choices=PHASES, required=True)
-    c_parser.add_argument("--proposal-id")
-    c_parser.set_defaults(handler=lambda args: run_query_faults(args, sys.modules[__name__]))
     run_parser.add_argument("--marketplace-dir", default=".")
     run_parser.add_argument("--gonka-dir", required=True)
+    # --- explicit-SHA provenance ------------------------------------------
+    # The selected Gonka commit comes from the active E2E plan and has no
+    # default. The snapshot must be exactly that commit; there is no prepared
+    # child, no overlay and no allow-listed path any more.
     run_parser.add_argument(
-        "--overlay-dir",
-        default=str(DEFAULT_GONKA_OVERLAY_DIR),
-        help="path to gonka-overlay directory in smart contract repo",
+        "--expected-gonka-sha",
+        required=True,
+        help="full 40-hex Gonka commit the read-only Gonka snapshot must be exactly",
     )
     run_parser.add_argument(
-        "--temp-gonka-dir",
-        help="explicit directory for temporary Gonka workspace copy",
+        "--expected-marketplace-sha",
+        help=(
+            "full 40-hex Marketplace commit the read-only contracts snapshot must be "
+            "exactly; when absent its HEAD is recorded and checked against itself"
+        ),
     )
     run_parser.add_argument(
-        "--keep-temp-gonka",
-        action="store_true",
-        help="keep temporary Gonka workspace after test run",
+        "--expected-proto-sha",
+        help=(
+            "reference ABI/protobuf SHA recorded in evidence. It is NOT derived from "
+            "--expected-gonka-sha: it describes format compatibility, not the running binary"
+        ),
     )
     run_parser.add_argument(
-        "--no-temp-gonka",
-        action="store_true",
-        help="run directly in --gonka-dir without creating a temporary copy",
+        "--expected-runtime",
+        action="append",
+        default=[],
+        metavar="FIELD=VALUE",
+        help=(
+            "repeatable: expected field of `inferenced version --long`, measured from the "
+            "selected sources (for example wasmd=v0.54.2 read from the target's go.mod)"
+        ),
+    )
+    run_parser.add_argument(
+        "--evidence-model",
+        default=EVIDENCE_MODEL_IMMUTABLE,
+        help=(
+            "which rules the evidence written by this run follows. Only "
+            f"{EVIDENCE_MODEL_IMMUTABLE!r} is accepted (the default)."
+        ),
+    )
+    run_parser.add_argument(
+        "--work-root",
+        help=(
+            "runner work root W for Gradle caches, build output, the Testermint network "
+            "root and the test Wasm target (default <gonka-dir>/../a8-work/<run-id>)"
+        ),
+    )
+    run_parser.add_argument(
+        "--testermint-harness-dir",
+        help="external Kotlin harness project (default <runner>/ops/a8/harness/testermint)",
+    )
+    run_parser.add_argument(
+        "--gradle-user-home",
+        help="run-scoped Gradle distribution/dependency cache outside both snapshots; build outputs stay task-local",
     )
     run_parser.add_argument(
         "--manifest",
-        help="verified A9 build manifest for current HEAD; omitted builds one first",
+        help="verified A9 build manifest for current HEAD (required by run-live)",
     )
     run_parser.add_argument("--evidence-dir", default="artifacts/a8-evidence")
     run_parser.add_argument("--run-id")
     run_parser.add_argument(
         "--scenario",
         choices=(
-            "full",
+            "funded-claim",
+            "no-buyer-claim-expiry",
+            "no-sale-vesting-lifecycle",
+            "emergency-host-only-recovery",
+            "funded-routing-refunds",
+            "unfunded-lock-boundaries",
+            "funded-gas-sweep",
             "claim-expiry-positive",
             "claim-expiry-zero",
             "network-unconfirmed",
@@ -6020,13 +6823,27 @@ def parser() -> argparse.ArgumentParser:
             "package-a-r1-r2",
             "package-b-r6-1",
             "package-b-r7-1",
-            "package-c-query-faults",
         ),
-        default="full",
-        help="run the full matrix or one isolated acceptance scenario",
+        default="funded-claim",
+        help="run the single funded happy-path test or one isolated acceptance scenario",
     )
     run_parser.add_argument("--timeout-minutes", type=int, default=35)
     run_parser.set_defaults(handler=run_live)
+
+    build_parser = commands.add_parser(
+        "build-external-harness",
+        help="pristine check, API check, upstream classpath export and harness testClasses; no network",
+    )
+    build_parser.add_argument("--gonka-dir", required=True)
+    build_parser.add_argument("--work-root", required=True)
+    build_parser.add_argument("--testermint-harness-dir")
+    build_parser.add_argument("--evidence-dir", help="default <work-root>/evidence")
+    build_parser.add_argument(
+        "--expected-gonka-sha",
+        help="full 40-hex commit the snapshot must be; default: its own HEAD, checked for pristine-ness",
+    )
+    build_parser.add_argument("--timeout-minutes", type=int, default=60)
+    build_parser.set_defaults(handler=build_external_harness)
     return root
 
 
@@ -6034,7 +6851,14 @@ def main() -> int:
     args = parser().parse_args()
     try:
         args.handler(args)
-    except (AcceptanceError, subprocess.TimeoutExpired, OSError, KeyError, ValueError) as exc:
+    except (
+        AcceptanceError,
+        external_harness.ExternalHarnessError,
+        subprocess.TimeoutExpired,
+        OSError,
+        KeyError,
+        ValueError,
+    ) as exc:
         print(f"A8 acceptance failed: {exc}", file=sys.stderr)
         return 1
     return 0

@@ -1,107 +1,19 @@
-"""Durable evidence across confirmed settlement and partial delivery failures."""
+"""Durable evidence across confirmed settlement and partial delivery failures.
+
+All fixtures are synthetic. No network, Docker, or live chain calls.
+"""
+
 import copy
-import importlib.util
-import json
-import sys
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
-SPEC = importlib.util.spec_from_file_location(
-    "a8_evidence_under_test", Path(__file__).resolve().parents[1] / "a8_acceptance.py"
-)
-a8 = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = a8
-SPEC.loader.exec_module(a8)
-
-
-class PaymentChain:
-    def __init__(self, path):
-        self.path = path
-        self.context = {
-            "chain": {"chain_id": "test"},
-            "terms": {"target_epoch": 5, "budget_micro_usdt": "100000000",
-                      "price_micro_usdt_per_gnk": "1000000", "fee_bps": 150},
-            "accounts": {"host": "host", "buyer": "buyer", "fee_recipient": "fees"},
-            "contracts": {"deal": "deal", "cw20": "token", "factory": "factory"},
-            "key_names": {"host": "host"}, "phases": [],
-        }
-        self.summary = {"epochPerformanceSummary": {
-            "claimed": True, "epoch_index": "5", "participant_id": "host",
-            "earned_coins": "80000000000", "rewarded_coins": "0",
-        }}
-        self.expected = a8.expected_claim_settlement(self.context, self.summary)
-        self.settled_state = {key: value for key, value in self.expected.items()
-                              if key not in {"cw20_deltas", "deal_outflow", "funded_capacity_ngonka"}}
-        self.settled_state["buyer"] = "buyer"
-        self.state = {"status": "locked", "buyer": "buyer"}
-        self.balances = {"deal": 100000000, "host": 0, "buyer": 0, "fees": 0}
-        self.roles = {"host": ("host", 78800000), "fee": ("fees", 1200000),
-                      "buyer": ("buyer", 20000000)}
-        self.pending = {role: amount for role, (_, amount) in self.roles.items()}
-        self.blocked = "fee"
-        self.calls = []
-        self.query_failure = False
-        self.payout_checks = []
-        a8.write_object(path, self.context)
-
-    def tx(self, *args, **kwargs):
-        return {"txhash": "CLAIM", "code": 0, "height": "9"}
-
-    def query_json(self, module, *args):
-        return copy.deepcopy(self.summary) if module == "inference" else {}
-
-    def bank_balance(self, address):
-        return 0
-
-    def cw20_balance(self, token, address):
-        return self.balances[address]
-
-    def smart(self, address, msg):
-        if "state" in msg:
-            return copy.deepcopy(self.state)
-        if "usdt_payments" in msg:
-            if self.query_failure:
-                raise a8.AcceptanceError("query unavailable after settlement")
-            return {role: {"recipient": recipient, "accrued_micro_usdt": str(amount),
-                           "pending_micro_usdt": str(self.pending[role]),
-                           "paid_micro_usdt": str(amount - self.pending[role])}
-                    for role, (recipient, amount) in self.roles.items()}
-        return {}
-
-    def execute(self, node, key, deal, msg, **kwargs):
-        self.calls.append(msg)
-        if "settle_claim" in msg:
-            if self.state["status"] != "locked":
-                raise a8.AcceptanceError("cannot settle claim in state")
-            self.state = copy.deepcopy(self.settled_state)
-            return {"txhash": "SETTLED", "code": 0, "height": "10"}
-        role = msg["withdraw_usdt"]["role"]
-        # Observe the actual file before each broadcast, not merely mock calls.
-        phases = a8.load_object(self.path)["phases"]
-        self.payout_checks.append(copy.deepcopy(phases))
-        if role == self.blocked:
-            raise a8.AcceptanceError("recipient blocked")
-        amount = self.pending[role]
-        if not amount:
-            raise a8.AcceptanceError("already paid")
-        self.balances[self.roles[role][0]] += amount
-        self.balances["deal"] -= amount
-        self.pending[role] = 0
-        return {"txhash": role.upper(), "code": 0, "height": "11"}
-
-    def tx_attempt(self, *args, **kwargs):
-        message = json.loads(args[-1])
-        if "withdraw_usdt" in message:
-            assert message["withdraw_usdt"]["role"] == self.blocked
-            log = "a8 injected cw20 transfer failure"
-        else:
-            assert "settle_claim" in message
-            log = "cannot settle claim in state Releasing"
-        return {"layer": "deliver_tx", "tx_hash": "REJECTED", "height": "12",
-                "code": 5, "codespace": "wasm", "raw_log": log}
+try:
+    from scripts.tests.support import PaymentChain, a8
+except ImportError:
+    from support import PaymentChain, a8
 
 
 class WithdrawalEvidenceTests(unittest.TestCase):
@@ -190,6 +102,15 @@ class WithdrawalEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(a8.AcceptanceError, "CW20 deltas differ"):
             a8.withdraw_usdt(Namespace(context=str(self.path)))
         self.assertEqual(self.phases()[-1]["status"], "confirmed")
+        self.assertFalse(any(p["name"] == "settlement_delivery_verified" for p in self.phases()))
+
+    def test_a_settled_state_with_one_extra_claim_unit_is_rejected_by_the_independent_oracle(self):
+        self.chain.blocked = None
+        # Derive the negative case from the positive chain response, changing
+        # just the total. The expected result and native summary stay intact.
+        self.chain.settled_state["total_claim_ngonka"] = "80000000001"
+        with self.assertRaisesRegex(a8.AcceptanceError, "settlement state differs"):
+            a8.claim_settle(self.args)
         self.assertFalse(any(p["name"] == "settlement_delivery_verified" for p in self.phases()))
 
     def test_merged_fault_positions_target_withdrawals_after_settlement(self):

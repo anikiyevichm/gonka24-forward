@@ -3,8 +3,9 @@ use std::marker::PhantomData;
 use cosmwasm_std::{
     coin, from_json,
     testing::{message_info, mock_env, MockApi, MockQuerier, MockStorage},
-    to_json_binary, Addr, Binary, ContractResult, Empty, GrpcQuery, OwnedDeps, Querier,
-    QuerierResult, QueryRequest, SystemError, SystemResult, Uint128, Uint256, WasmQuery,
+    to_json_binary, Addr, Binary, ContractResult, Empty, GrpcQuery, Order, OwnedDeps, Querier,
+    QuerierResult, QueryRequest, Record, Storage, SystemError, SystemResult, Uint128, Uint256,
+    WasmQuery,
 };
 use cw2::get_contract_version;
 use cw20::TokenInfoResponse;
@@ -35,6 +36,8 @@ fn test_addr(label: &str) -> Addr {
 struct DealMockQuerier {
     base: MockQuerier<Empty>,
     current_epoch_response: Result<Binary, ()>,
+    current_epoch_override: Option<QuerierResult>,
+    routing_override: Option<QuerierResult>,
     claim_recipients_response: Result<Binary, ()>,
     performance_response: Result<Binary, ()>,
     performance_result_override: Option<QuerierResult>,
@@ -75,13 +78,17 @@ impl DealMockQuerier {
         match request.path.as_str() {
             marketplace_common::gonka::GET_CURRENT_EPOCH_PATH => {
                 QueryGetCurrentEpochRequest::decode(request.data.as_slice()).unwrap();
-                Self::response(&self.current_epoch_response)
+                self.current_epoch_override
+                    .clone()
+                    .unwrap_or_else(|| Self::response(&self.current_epoch_response))
             }
             crate::gonka::LIST_CLAIM_RECIPIENTS_PATH => {
                 let decoded =
                     QueryListClaimRecipientsRequest::decode(request.data.as_slice()).unwrap();
                 assert_eq!(decoded.participant, test_addr(HOST).to_string());
-                Self::response(&self.claim_recipients_response)
+                self.routing_override
+                    .clone()
+                    .unwrap_or_else(|| Self::response(&self.claim_recipients_response))
             }
             crate::gonka::EPOCH_PERFORMANCE_PATH => {
                 let decoded = QueryEpochPerformanceSummaryByParticipantRequest::decode(
@@ -182,6 +189,8 @@ fn mock_deps(
                 .encode_to_vec(),
             )),
             performance_result_override: None,
+            current_epoch_override: None,
+            routing_override: None,
             remaining_vesting: Uint128::new(70),
             total_vesting_query_fails: false,
         },
@@ -936,6 +945,76 @@ fn assert_event_attributes(response: &Response, event_type: &str, expected: &[(&
     }
 }
 
+// Direct execute calls have no transaction rollback: include every key, even
+// keys introduced later, when proving that a rejected call made no writes.
+fn storage_snapshot(storage: &dyn Storage) -> Vec<Record> {
+    storage.range(None, None, Order::Ascending).collect()
+}
+
+fn assert_locked(storage: &dyn Storage, response: &Response, mut before: DealState) {
+    before.status = DealStatus::Locked;
+    before.recipient_locked = true;
+    assert_eq!(STATE.load(storage).unwrap(), before);
+    assert!(response.messages.is_empty());
+    assert_event_attributes(
+        response,
+        "deal_locked",
+        &[
+            ("deal", mock_env().contract.address.to_string()),
+            ("host", test_addr(HOST).to_string()),
+            ("target_epoch", "11".to_string()),
+        ],
+    );
+    let buyer_attribute = response.events[0]
+        .attributes
+        .iter()
+        .find(|attribute| attribute.key == "buyer");
+    assert_eq!(
+        buyer_attribute.map(|attribute| attribute.value.clone()),
+        before.buyer.map(|buyer| buyer.to_string())
+    );
+}
+
+fn assert_network_unconfirmed_refund(
+    storage: &dyn Storage,
+    response: &Response,
+    mut before: DealState,
+) {
+    let config = CONFIG.load(storage).unwrap();
+    let amount = config.buyer_budget_micro_usdt;
+    before.status = DealStatus::Refunded;
+    before.refund_reason = Some(RefundReason::NetworkUnconfirmed);
+    before.gnk_release_policy = GnkReleasePolicy::HostOnly;
+    before.buyer_refund_usdt = amount;
+    assert_eq!(STATE.load(storage).unwrap(), before);
+    assert_eq!(response.messages.len(), 1);
+    assert_cw20_transfer(
+        &response.messages[0],
+        &test_addr(TOKEN),
+        &test_addr(BUYER),
+        amount,
+    );
+    for (event, recipient_key) in [("deal_refunded", "buyer"), ("usdt_refunded", "recipient")] {
+        assert_event_attributes(
+            response,
+            event,
+            &[
+                ("deal", mock_env().contract.address.to_string()),
+                ("host", test_addr(HOST).to_string()),
+                ("target_epoch", config.target_epoch.to_string()),
+                (recipient_key, test_addr(BUYER).to_string()),
+                ("reason", "network_unconfirmed".to_string()),
+                ("amount_micro_usdt", amount.to_string()),
+            ],
+        );
+    }
+    assert_event_attributes(
+        response,
+        "deal_refunded",
+        &[("status", "refunded".to_string())],
+    );
+}
+
 #[test]
 fn lock_open_no_sale_and_funded_preserve_config_accounting_and_emit_event() {
     for funded in [false, true] {
@@ -962,33 +1041,8 @@ fn lock_open_no_sale_and_funded_preserve_config_accounting_and_emit_event() {
         )
         .unwrap();
 
-        assert!(response.messages.is_empty());
         assert_eq!(CONFIG.load(&deps.storage).unwrap(), config_before);
-        let state = STATE.load(&deps.storage).unwrap();
-        assert_eq!(state.status, DealStatus::Locked);
-        assert!(state.recipient_locked);
-        assert_eq!(state.buyer, state_before.buyer);
-        assert_eq!(state.work_ngonka, state_before.work_ngonka);
-        assert_eq!(state.reward_ngonka, state_before.reward_ngonka);
-        assert_eq!(state.total_claim_ngonka, state_before.total_claim_ngonka);
-        assert_eq!(state.gross_usdt, state_before.gross_usdt);
-        assert_event_attributes(
-            &response,
-            "deal_locked",
-            &[
-                ("deal", mock_env().contract.address.to_string()),
-                ("host", test_addr(HOST).to_string()),
-                ("target_epoch", "11".to_string()),
-            ],
-        );
-        let buyer_attribute = response.events[0]
-            .attributes
-            .iter()
-            .find(|attribute| attribute.key == "buyer");
-        assert_eq!(
-            buyer_attribute.map(|attribute| attribute.value.clone()),
-            state.buyer.map(|buyer| buyer.to_string())
-        );
+        assert_locked(&deps.storage, &response, state_before);
     }
 }
 
@@ -1744,108 +1798,54 @@ fn claim_expiry_rejects_claimed_or_untrustworthy_summary_evidence() {
         assert_eq!(STATE.load(&deps.storage).unwrap(), before);
     }
 
-    let evidence = [
-        Ok(Binary::default()),
-        Ok(Binary::from(vec![0xff])),
-        Ok(Binary::from(vec![
-            0;
-            crate::gonka::MAX_GRPC_RESPONSE_BYTES + 1
-        ])),
-        Err(()),
-        Ok(Binary::from(
-            QueryEpochPerformanceSummaryByParticipantResponse {
-                epoch_performance_summary: Some(EpochPerformanceSummary {
-                    epoch_index: 12,
-                    participant_id: test_addr(HOST).to_string(),
-                    claimed: false,
-                    ..EpochPerformanceSummary::default()
-                }),
-            }
-            .encode_to_vec(),
-        )),
-        Ok(Binary::from(
-            QueryEpochPerformanceSummaryByParticipantResponse {
-                epoch_performance_summary: Some(EpochPerformanceSummary {
-                    epoch_index: 11,
-                    participant_id: test_addr("other-host").to_string(),
-                    claimed: false,
-                    ..EpochPerformanceSummary::default()
-                }),
-            }
-            .encode_to_vec(),
-        )),
-    ];
-    for response in evidence {
+    for fault in [
+        SummaryFault::MissingNestedSummary,
+        SummaryFault::MalformedProtobuf,
+        SummaryFault::OversizedResponse,
+        SummaryFault::UnsupportedRequest,
+        SummaryFault::WrongEpoch,
+        SummaryFault::WrongHost,
+    ] {
         let mut deps = mock_deps(10, SETTLEMENT_TOKEN_DECIMALS);
         prepare_locked(&mut deps, true);
         set_current_epoch(&mut deps, 13);
-        deps.querier.performance_response = response;
-        let before = STATE.load(&deps.storage).unwrap();
-        assert!(matches!(
+        let (_, expected) = inject_summary_fault(&mut deps, fault);
+        let before = storage_snapshot(&deps.storage);
+        assert_eq!(
             execute(
                 deps.as_mut(),
                 mock_env(),
                 message_info(&test_addr("caller"), &[]),
                 ExecuteMsg::Refund {},
-            ),
-            Err(ContractError::Gonka(
-                GonkaQueryError::MissingField { .. }
-                    | GonkaQueryError::DecodeFailed { .. }
-                    | GonkaQueryError::ResponseTooLarge { .. }
-                    | GonkaQueryError::QueryFailed { .. }
-                    | GonkaQueryError::UnsupportedRequest { .. }
-                    | GonkaQueryError::IdentityMismatch { .. }
-            ))
-        ));
-        assert_eq!(STATE.load(&deps.storage).unwrap(), before);
+            )
+            .unwrap_err(),
+            ContractError::Gonka(expected)
+        );
+        assert_eq!(storage_snapshot(&deps.storage), before);
     }
 }
 
 #[test]
 fn network_unconfirmed_refund_accepts_only_explicit_summary_failure_matrix_after_e_plus_three() {
-    for case in 0..9 {
+    for (index, case) in [
+        SummaryFault::HandlerError,
+        SummaryFault::UnsupportedRequest,
+        SummaryFault::InvalidResponse,
+        SummaryFault::MissingNestedSummary,
+        SummaryFault::MalformedProtobuf,
+        SummaryFault::OversizedResponse,
+        SummaryFault::WrongEpoch,
+        SummaryFault::InvalidParticipantAddress,
+        SummaryFault::WrongHost,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut deps = mock_deps(10, SETTLEMENT_TOKEN_DECIMALS);
         prepare_locked(&mut deps, true);
-        set_current_epoch(&mut deps, if case % 2 == 0 { 14 } else { 99 });
-        match case {
-            0 => {
-                deps.querier.performance_result_override = Some(SystemResult::Ok(
-                    ContractResult::Err("redacted native error".to_string()),
-                ));
-            }
-            1 => {
-                deps.querier.performance_result_override =
-                    Some(SystemResult::Err(SystemError::UnsupportedRequest {
-                        kind: "route unavailable".to_string(),
-                    }));
-            }
-            2 => {
-                deps.querier.performance_result_override =
-                    Some(SystemResult::Err(SystemError::InvalidResponse {
-                        error: "invalid Go response envelope".to_string(),
-                        response: Binary::from(b"not-json".as_slice()),
-                    }));
-            }
-            3 => deps.querier.performance_response = Ok(Binary::default()),
-            4 => deps.querier.performance_response = Ok(Binary::from(vec![0xff])),
-            5 => {
-                deps.querier.performance_response = Ok(Binary::from(vec![
-                    0;
-                    crate::gonka::MAX_GRPC_RESPONSE_BYTES
-                        + 1
-                ]));
-            }
-            6 => set_performance(&mut deps, 12, test_addr(HOST).to_string(), 0, 0, false),
-            7 => set_performance(&mut deps, 11, "x".to_string(), 0, 0, false),
-            _ => set_performance(
-                &mut deps,
-                11,
-                test_addr("other-host").to_string(),
-                0,
-                0,
-                false,
-            ),
-        }
+        set_current_epoch(&mut deps, if index % 2 == 0 { 14 } else { 99 });
+        inject_summary_fault(&mut deps, case);
+        let before = STATE.load(&deps.storage).unwrap();
 
         let response = execute(
             deps.as_mut(),
@@ -1854,21 +1854,7 @@ fn network_unconfirmed_refund_accepts_only_explicit_summary_failure_matrix_after
             ExecuteMsg::Refund {},
         )
         .unwrap();
-        let state = STATE.load(&deps.storage).unwrap();
-        assert_eq!(state.status, DealStatus::Refunded, "case {case}");
-        assert_eq!(
-            state.refund_reason,
-            Some(RefundReason::NetworkUnconfirmed),
-            "case {case}"
-        );
-        assert_eq!(state.gnk_release_policy, GnkReleasePolicy::HostOnly);
-        assert_eq!(state.buyer_refund_usdt, Uint128::new(100_000_000));
-        assert_eq!(response.messages.len(), 1);
-        assert_event_attributes(
-            &response,
-            "deal_refunded",
-            &[("reason", "network_unconfirmed".to_string())],
-        );
+        assert_network_unconfirmed_refund(&deps.storage, &response, before);
     }
 }
 
@@ -3162,4 +3148,400 @@ fn withdrawal_requires_a_nonzero_obligation_and_rejects_native_funds() {
         .unwrap_err(),
         ContractError::NothingToWithdraw
     );
+}
+
+#[derive(Clone, Copy)]
+enum SummaryFault {
+    HandlerError,
+    UnsupportedRequest,
+    InvalidResponse,
+    MalformedProtobuf,
+    OversizedResponse,
+    MissingNestedSummary,
+    WrongHost,
+    WrongEpoch,
+    InvalidParticipantAddress,
+}
+
+fn inject_summary_fault(
+    deps: &mut OwnedDeps<MockStorage, MockApi, DealMockQuerier, Empty>,
+    fault: SummaryFault,
+) -> (&'static str, GonkaQueryError) {
+    use crate::gonka::{EPOCH_PERFORMANCE_PATH as ROUTE, MAX_GRPC_RESPONSE_BYTES as MAX};
+    match fault {
+        SummaryFault::HandlerError => {
+            deps.querier.performance_result_override = Some(SystemResult::Ok(ContractResult::Err(
+                "handler failure".into(),
+            )));
+            (
+                "handler_error",
+                GonkaQueryError::QueryFailed { route: ROUTE },
+            )
+        }
+        SummaryFault::UnsupportedRequest => {
+            deps.querier.performance_result_override =
+                Some(SystemResult::Err(SystemError::UnsupportedRequest {
+                    kind: "route".into(),
+                }));
+            (
+                "unsupported_request",
+                GonkaQueryError::UnsupportedRequest { route: ROUTE },
+            )
+        }
+        SummaryFault::InvalidResponse => {
+            deps.querier.performance_result_override =
+                Some(SystemResult::Err(SystemError::InvalidResponse {
+                    error: "invalid Go response envelope".into(),
+                    response: Binary::from(b"not-json".as_slice()),
+                }));
+            (
+                "invalid_response",
+                GonkaQueryError::InvalidResponse { route: ROUTE },
+            )
+        }
+        SummaryFault::MalformedProtobuf => {
+            deps.querier.performance_response = Ok(Binary::from(vec![0xff]));
+            (
+                "malformed_protobuf",
+                GonkaQueryError::DecodeFailed { route: ROUTE },
+            )
+        }
+        SummaryFault::OversizedResponse => {
+            deps.querier.performance_response = Ok(Binary::from(vec![0; MAX + 1]));
+            (
+                "oversized_response",
+                GonkaQueryError::ResponseTooLarge {
+                    route: ROUTE,
+                    actual: MAX + 1,
+                    maximum: MAX,
+                },
+            )
+        }
+        SummaryFault::MissingNestedSummary => {
+            deps.querier.performance_response = Ok(Binary::default());
+            (
+                "missing_nested_summary",
+                GonkaQueryError::MissingField {
+                    route: ROUTE,
+                    field: "epoch_performance_summary",
+                },
+            )
+        }
+        SummaryFault::WrongHost => {
+            set_performance(deps, 11, test_addr("other-host").to_string(), 1, 2, true);
+            (
+                "wrong_host",
+                GonkaQueryError::IdentityMismatch {
+                    route: ROUTE,
+                    field: "participant_id",
+                },
+            )
+        }
+        SummaryFault::WrongEpoch => {
+            set_performance(deps, 12, test_addr(HOST).to_string(), 1, 2, true);
+            (
+                "wrong_epoch",
+                GonkaQueryError::IdentityMismatch {
+                    route: ROUTE,
+                    field: "epoch_index",
+                },
+            )
+        }
+        SummaryFault::InvalidParticipantAddress => {
+            set_performance(deps, 11, "x".into(), 1, 2, true);
+            (
+                "invalid_participant_address",
+                GonkaQueryError::InvalidAddress {
+                    route: ROUTE,
+                    field: "participant_id",
+                },
+            )
+        }
+    }
+}
+
+// Faults are injected at the raw-query boundary; the production decoder and
+// contract state machine are exercised over CosmWasm test dependencies.
+// Package C freezes the short c_* entry-point names and C_CASE markers in
+// ops/a8/verifier.py, so these wrappers retain that naming exception.
+fn c_summary_policy(fault: SummaryFault) {
+    let mut deps = mock_deps(10, SETTLEMENT_TOKEN_DECIMALS);
+    prepare_locked(&mut deps, true);
+    set_current_epoch(&mut deps, 13); // E+2
+    let (kind, expected) = inject_summary_fault(&mut deps, fault);
+    let before = storage_snapshot(&deps.storage);
+    for (suffix, msg) in [
+        ("probe", ExecuteMsg::SettleClaim {}),
+        ("e2", ExecuteMsg::Refund {}),
+    ] {
+        let error = execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&test_addr("caller"), &[]),
+            msg,
+        )
+        .unwrap_err();
+        match error {
+            ContractError::Gonka(actual) => assert_eq!(actual, expected),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(storage_snapshot(&deps.storage), before);
+        println!("C_CASE:r4-{kind}-{suffix}");
+    }
+    set_current_epoch(&mut deps, 14); // E+3, never E+2
+    let state_before = STATE.load(&deps.storage).unwrap();
+    let response = execute(
+        deps.as_mut(),
+        mock_env(),
+        message_info(&test_addr("caller"), &[]),
+        ExecuteMsg::Refund {},
+    )
+    .unwrap();
+    assert_network_unconfirmed_refund(&deps.storage, &response, state_before);
+    let terminal = storage_snapshot(&deps.storage);
+    println!("C_CASE:r4-{kind}-e3");
+    deps.querier.performance_result_override = None;
+    set_performance(&mut deps, 11, test_addr(HOST).to_string(), 1, 2, true);
+    for (suffix, msg, error) in [
+        (
+            "terminal-refund",
+            ExecuteMsg::Refund {},
+            ContractError::InvalidRefundState {
+                actual: DealStatus::Refunded,
+            },
+        ),
+        (
+            "terminal-settle_claim",
+            ExecuteMsg::SettleClaim {},
+            ContractError::InvalidSettlementState {
+                actual: DealStatus::Refunded,
+            },
+        ),
+    ] {
+        assert_eq!(
+            execute(
+                deps.as_mut(),
+                mock_env(),
+                message_info(&test_addr("caller"), &[]),
+                msg
+            )
+            .unwrap_err(),
+            error
+        );
+        assert_eq!(storage_snapshot(&deps.storage), terminal);
+        println!("C_CASE:r4-{kind}-{suffix}");
+    }
+}
+
+#[test]
+fn c_policy_handler_error() {
+    c_summary_policy(SummaryFault::HandlerError);
+}
+
+#[test]
+fn c_policy_malformed_protobuf() {
+    c_summary_policy(SummaryFault::MalformedProtobuf);
+}
+
+#[test]
+fn c_policy_oversized_response() {
+    c_summary_policy(SummaryFault::OversizedResponse);
+}
+
+#[test]
+fn c_policy_missing_nested_summary() {
+    c_summary_policy(SummaryFault::MissingNestedSummary);
+}
+
+#[test]
+fn c_policy_wrong_host() {
+    c_summary_policy(SummaryFault::WrongHost);
+}
+
+#[test]
+fn c_policy_wrong_epoch() {
+    c_summary_policy(SummaryFault::WrongEpoch);
+}
+
+#[test]
+fn c_policy_invalid_participant_address() {
+    c_summary_policy(SummaryFault::InvalidParticipantAddress);
+}
+
+#[test]
+fn c_policy_unsupported_request() {
+    c_summary_policy(SummaryFault::UnsupportedRequest);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RoutingFault {
+    Epoch,
+    HandlerError,
+    MalformedProtobuf,
+    DuplicateRouting,
+}
+
+fn c_routing_policy(fault: RoutingFault, refund: bool) {
+    let mut deps = mock_deps(10, SETTLEMENT_TOKEN_DECIMALS);
+    let op = if refund { "refund" } else { "lock" };
+    if fault == RoutingFault::Epoch && refund {
+        prepare_locked(&mut deps, true);
+        set_current_epoch(&mut deps, 14);
+        deps.querier.performance_result_override = Some(SystemResult::Ok(ContractResult::Err(
+            "summary unavailable".into(),
+        )));
+    } else {
+        prepare_funded_for_refund(
+            &mut deps,
+            11,
+            vec![ClaimRecipientEntry {
+                epoch: 11,
+                recipient: mock_env().contract.address.to_string(),
+            }],
+        );
+    }
+    let before = storage_snapshot(&deps.storage);
+    let state_before = STATE.load(&deps.storage).unwrap();
+    let config_before = CONFIG.load(&deps.storage).unwrap();
+    let route = crate::gonka::LIST_CLAIM_RECIPIENTS_PATH;
+    let (kind, expected) = match fault {
+        RoutingFault::Epoch => {
+            deps.querier.current_epoch_override = Some(SystemResult::Ok(ContractResult::Err(
+                "epoch unavailable".into(),
+            )));
+            (
+                "epoch",
+                ContractError::CommonGonka(
+                    marketplace_common::error::GonkaQueryError::QueryFailed {
+                        route: marketplace_common::gonka::GET_CURRENT_EPOCH_PATH,
+                    },
+                ),
+            )
+        }
+        RoutingFault::HandlerError => {
+            deps.querier.routing_override = Some(SystemResult::Ok(ContractResult::Err(
+                "routing unavailable".into(),
+            )));
+            (
+                "handler_error",
+                ContractError::Gonka(GonkaQueryError::QueryFailed { route }),
+            )
+        }
+        RoutingFault::MalformedProtobuf => {
+            deps.querier.claim_recipients_response = Ok(Binary::from(vec![0xff]));
+            (
+                "malformed_protobuf",
+                ContractError::Gonka(GonkaQueryError::DecodeFailed { route }),
+            )
+        }
+        RoutingFault::DuplicateRouting => {
+            set_claim_recipients(
+                &mut deps,
+                vec![
+                    ClaimRecipientEntry {
+                        epoch: 11,
+                        recipient: mock_env().contract.address.to_string()
+                    };
+                    2
+                ],
+            );
+            (
+                "duplicate_routing",
+                ContractError::Gonka(GonkaQueryError::DuplicateClaimRecipient { epoch: 11 }),
+            )
+        }
+    };
+    let msg = || {
+        if refund {
+            ExecuteMsg::Refund {}
+        } else {
+            ExecuteMsg::Lock {}
+        }
+    };
+    assert_eq!(
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            message_info(&test_addr("caller"), &[]),
+            msg()
+        )
+        .unwrap_err(),
+        expected
+    );
+    assert_eq!(storage_snapshot(&deps.storage), before);
+    println!("C_CASE:r3-{kind}-{op}");
+    // The frozen "healthy" marker means the tested epoch/routing query recovered.
+    // Epoch-refund deliberately retains the summary fault, so its recovered
+    // current-epoch query permits a NetworkUnconfirmed emergency refund.
+    deps.querier.current_epoch_override = None;
+    deps.querier.routing_override = None;
+    set_claim_recipients(
+        &mut deps,
+        vec![ClaimRecipientEntry {
+            epoch: 11,
+            recipient: mock_env().contract.address.to_string(),
+        }],
+    );
+    let result = execute(
+        deps.as_mut(),
+        mock_env(),
+        message_info(&test_addr("caller"), &[]),
+        msg(),
+    );
+    if refund && fault != RoutingFault::Epoch {
+        assert_eq!(
+            result.unwrap_err(),
+            ContractError::RefundRecipientStillRouted { epoch: 11 }
+        );
+        assert_eq!(storage_snapshot(&deps.storage), before);
+    } else {
+        let response = result.unwrap();
+        assert_eq!(CONFIG.load(&deps.storage).unwrap(), config_before);
+        if refund {
+            assert_network_unconfirmed_refund(&deps.storage, &response, state_before);
+        } else {
+            assert_locked(&deps.storage, &response, state_before);
+        }
+    }
+    println!("C_CASE:r3-{kind}-{op}-healthy");
+}
+
+#[test]
+fn c_routing_handler_error_lock() {
+    c_routing_policy(RoutingFault::HandlerError, false);
+}
+
+#[test]
+fn c_routing_handler_error_refund() {
+    c_routing_policy(RoutingFault::HandlerError, true);
+}
+
+#[test]
+fn c_routing_malformed_protobuf_lock() {
+    c_routing_policy(RoutingFault::MalformedProtobuf, false);
+}
+
+#[test]
+fn c_routing_malformed_protobuf_refund() {
+    c_routing_policy(RoutingFault::MalformedProtobuf, true);
+}
+
+#[test]
+fn c_routing_duplicate_routing_lock() {
+    c_routing_policy(RoutingFault::DuplicateRouting, false);
+}
+
+#[test]
+fn c_routing_duplicate_routing_refund() {
+    c_routing_policy(RoutingFault::DuplicateRouting, true);
+}
+
+#[test]
+fn c_routing_epoch_lock() {
+    c_routing_policy(RoutingFault::Epoch, false);
+}
+
+#[test]
+fn c_routing_epoch_refund() {
+    c_routing_policy(RoutingFault::Epoch, true);
 }

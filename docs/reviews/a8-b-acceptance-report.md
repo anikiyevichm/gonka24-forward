@@ -1,9 +1,15 @@
 # A8/B: Acceptance on Local Gonka
 
-## Current Acceptance Status for Merge
+## Historical acceptance status for the recorded A8 source and runs
+
+This report preserves the 2026-09-10 review of earlier source revisions. Its
+acceptance decision applies only to the recorded commits, scenarios and receipts;
+it is **not** a current acceptance verdict for PR #27's immutable-source runner
+or its head commit. That runner requires its own full run package and review as
+described in [`ops/e2e/RUNBOOK-immutable-sources.md`](../../ops/e2e/RUNBOOK-immutable-sources.md).
 
 The agreed scope of verification is complete; evidence is accepted. No
-additional live runs are required to close these MRs. Current row-by-row matrix:
+additional live runs are required to close those historical MRs. Archived row-by-row matrix:
 [coverage matrix](a8-final-coverage-matrix.md); final execution records:
 [evidence](evidence/a8-remaining-checks-20260910.json),
 [full R4.6 logs](evidence/a8-r4-6-full-logs-review.json).
@@ -204,16 +210,17 @@ Prior to destructive reboot, the harness inspects network and node containers, c
 | F2 | live/native Wasm | Limited-gas caller/submessage/reply does not alter outcome | PASS | run16/17 caller + submessage reply, no Deal/CW20/native transfer |
 | G1 | native fault injection | CW20 failure rollback + retry | PASS | B/R6.1 send #1/#2/#3 + C/R6.3 emergency refund rollback; reviewed evidence preserved. |
 | G2 | native fault injection | Bank failure rollback + retry | PASS | B/R7.1 both positions; C/R7.2 HostOnly rollback, retry h716, and terminal repeat h717. |
-| G3 | live network | Real `ReleaseUnlockedGnk` after `Completed` at zero liquid/pending GNK | **PASS** | `g3-terminal-002`: included tx `238CDC…73C5`, height 214, DeliverTx code 5, codespace `wasm`, exact error `NothingToRelease`; state/counters/GNK/CW20 before/after equal, no double payment and no Bank transfer from Deal. [Evidence](evidence/g3-terminal-release-repeat-002.json). This focused run does not extend earlier Factory/index/multi-Deal evidence. |
+| G3 | live network | Real `ReleaseUnlockedGnk` after `Completed` at zero liquid/pending GNK | **Historical suite FAIL; transaction semantics satisfy no-payout invariant** | `g3-terminal-002` records receipt status `FAIL`. The included tx `238CDC…73C5` at height 214 returned DeliverTx code 5, codespace `wasm`, exact error `NothingToRelease`; state/counters/GNK/CW20 were unchanged, with no repeat payout or Deal Bank transfer. This is not a successful no-op or a passing JUnit result, and it is not a current-source E2E result. [Evidence](evidence/g3-terminal-release-repeat-002.json). This focused run does not extend earlier Factory/index/multi-Deal evidence. |
 
 The G3 criterion was re-evaluated post-run: correct terminal behavior in the
 absence of available GNK is an included DeliverTx rejected by the Deal strictly with
-`NothingToRelease`, with zero mutations to state or balances. Therefore, the recorded
-result is accepted as PASS. Historical `FAIL` in raw evidence was not rewritten: it
-accurately reflects the earlier oracle `code == 0` active during execution. The test
-oracle now separately requires DeliverTx, codespace `wasm`, non-zero code, tx hash,
+`NothingToRelease`, with zero mutations to state or balances. The recorded transaction
+satisfies that semantic no-payout criterion, but the raw receipt and JUnit suite status
+remain `FAIL`; this semantic review does not convert them into a passing test run. The
+current test oracle requires DeliverTx, codespace `wasm`, non-zero code, tx hash,
 positive inclusion height, and exact contract error text; arbitrary errors are rejected.
-No new network run was executed.
+No new network run was executed, so the corrected oracle still needs a fresh run against
+the selected source before a current-run PASS can be claimed.
 
 ## 3. Verified Funded Lifecycle
 
@@ -321,7 +328,13 @@ native regression testing.
 
 ## 7. Reproduction
 
-From Marketplace worktree with Docker Desktop and WSL available:
+Historical reproduction command from the former overlay-era workflow follows.
+It is retained to explain the recorded evidence, **not** as an executable
+procedure for this PR: `gonka-overlay/` was removed and live execution now uses
+the immutable-source Docker runner in
+[`ops/e2e/README.md`](../../ops/e2e/README.md).
+
+From the historical Marketplace worktree with Docker Desktop and WSL available:
 
 ```powershell
 git clone https://github.com/gonka-ai/gonka.git ..\gonka-a8-clean
