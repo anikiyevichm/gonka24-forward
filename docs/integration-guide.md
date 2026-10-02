@@ -468,7 +468,8 @@ evidence is recorded in [A8/B acceptance report](reviews/a8-b-acceptance-report.
 Reproducible runs require a clean Marketplace checkout and a clean Gonka checkout
 at the selected commit. **The Gonka checkout is never modified**: the Marketplace
 Kotlin scenarios, Compose fragments, the B3 genesis provisioner, the API container
-controller and the Go/Wasm probes live on our side under `ops/a8/harness/`.
+controller and the Go/Wasm probes live in
+[`gonka24/forward-e2e`](https://github.com/gonka24/forward-e2e/tree/main/ops/a8/harness).
 
 When executing `a8_acceptance.py run-live`, the harness:
 1. Verifies that both checkouts are exactly their selected commits (HEAD, tree, tracked bytes, submodules, no added or ignored files).
@@ -476,17 +477,18 @@ When executing `a8_acceptance.py run-live`, the harness:
 3. Builds the selected Gonka's unmodified Testermint and the external harness out-of-tree under `--work-root`, and prepares a separate network work directory (`GONKA_REPO_ROOT`) with byte-identical copies of the upstream network resources.
 4. Runs the selected scenario, collects JUnit and logs from the external project, and re-verifies both checkouts; any change fails the run (`source-immutability.json`).
 
-In practice run it through the E2E runner (`ops/e2e/run-e2e.sh`); see
-[`ops/e2e/RUNBOOK-immutable-sources.md`](../ops/e2e/RUNBOOK-immutable-sources.md).
-The direct invocation below is kept for reference:
+Run it from a separate `forward-e2e` checkout; see the
+[E2E validation handoff](e2e-validation.md) and the
+[runner runbook](https://github.com/gonka24/forward-e2e/blob/main/ops/e2e/RUNBOOK-immutable-sources.md).
 
 ```powershell
-git clone https://github.com/gonka-ai/gonka.git ..\gonka-clean
-python scripts/a8_acceptance.py run-live `
-  --gonka-dir ..\gonka-clean `
-  --expected-gonka-sha <GONKA_FULL_40_HEX_SHA> `
-  --manifest artifacts/a9-local/build-manifest.json `
-  --run-id a8-funded-local --timeout-minutes 60
+.\ops\e2e\Run-E2E.ps1 run `
+  --gonka-repo https://github.com/gonka-ai/gonka `
+  --gonka-sha <GONKA_FULL_40_HEX_SHA> `
+  --contracts-repo https://github.com/gonka24/forward-contracts `
+  --contracts-sha <CONTRACTS_FULL_40_HEX_SHA> `
+  --scenario funded-claim `
+  --output .\out\e2e
 ```
 
 If `--manifest` is omitted, harness performs two pinned A9 optimizer builds first.
