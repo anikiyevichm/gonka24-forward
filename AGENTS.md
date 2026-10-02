@@ -12,7 +12,7 @@ modules, Docker network templates or Python acceptance tests here.
 
 - Keep behavior changes and their Rust tests in the same PR.
 - Preserve the fail-closed query boundary, accounting invariants and independent
-  USDT withdrawals described in SECURITY.md and docs/decisions/.
+  USDT withdrawals described in SECURITY.md and docs/contract-behavior.md.
 - Keep committed schemas, protobuf snapshots and lockfiles reproducible.
 - The three small crates under tests/contracts/ remain inputs to the E2E build:
   the runner builds them from the same selected contracts SHA. They are not
@@ -32,7 +32,7 @@ python3 -B -m unittest discover -s scripts/tests -p 'test_*.py' -v
 Release tooling tests use unittest and offline fixtures. Do not claim local
 unit or cw-multi-test results as proof of compatibility with a live Gonka chain.
 A release requires fresh E2E evidence for the exact full contracts SHA, Gonka SHA
-and runner image. See docs/e2e-validation.md.
+and runner image. See docs/validation.md.
 
 scripts/a9_release.py is the canonical product release/deployment helper. The
 E2E runner contains a separately pinned copy hashed into its run lock; changes

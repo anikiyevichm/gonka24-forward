@@ -50,7 +50,7 @@ Re-verifying an existing release bundle does not trigger a build:
 python scripts/a9_release.py verify-artifacts --manifest artifacts/a9-local/build-manifest.json
 ```
 
-Deployment is divided into read-only preparation and explicit transaction broadcast. The complete workflow, config/receipt formats, and integration of an external Gonka checkout are documented in [`docs/deployment-tooling.md`](../docs/deployment-tooling.md). Private keys and seed phrases are excluded from all formats; `tx.from` is strictly a key name or public address accessible to the specified CLI.
+Deployment is divided into read-only preparation and explicit transaction broadcast. The complete workflow, config/receipt formats, and integration of an external Gonka checkout are documented in [`docs/release-guide.md`](../docs/release-guide.md). Private keys and seed phrases are excluded from all formats; `tx.from` is strictly a key name or public address accessible to the specified CLI.
 
 Tooling tests do not access the network and rely on verified JSON response fixtures:
 
@@ -65,5 +65,5 @@ tooling. They do not prove compatibility with a live running fork of Gonka.
 
 The acceptance harness and host wrappers live in
 [gonka24/forward-e2e](https://github.com/gonka24/forward-e2e).
-See the [E2E validation handoff](../docs/e2e-validation.md) for the repository
+See the [validation guide](../docs/validation.md) for the repository
 boundary and the exact source identities required for a release.
