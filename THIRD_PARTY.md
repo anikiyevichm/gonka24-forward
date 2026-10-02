@@ -8,8 +8,9 @@ Licensor holds the necessary rights. It does not replace third-party terms.
   [provenance](packages/gonka-proto/proto/PROVENANCE.toml) identify the sources.
 - `packages/gonka-proto/src/generated/` contains generated bindings derived from
   that snapshot. Generation does not remove applicable upstream terms.
-- Upstream-derived A8 harness material must be tracked to its individual source
-  revision. `A8UpstreamTestSupport.kt` identifies its verbatim helper source as
+- Upstream-derived A8 harness material now lives in
+  [forward-e2e](https://github.com/gonka24/forward-e2e/tree/main/ops/a8/harness).
+  Its retained provenance below remains tied to each individual source revision. `A8UpstreamTestSupport.kt` identifies its verbatim helper source as
   Gonka commit `c33c9eaa5bc40c53b564159b5e1534bbfdab8a08`,
   `testermint/src/test/kotlin/DevshardTestSupport.kt` lines 340–364. The genesis
   provisioner identifies the source sequence and its SHA-256 in its header;

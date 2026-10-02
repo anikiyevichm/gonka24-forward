@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
 license = "BUSL-1.1"
-repository = "https://github.com/anikiyevichm/gonka24-forward"
+repository = "https://github.com/gonka24/forward-contracts"
 publish = false
 
 [workspace.dependencies]

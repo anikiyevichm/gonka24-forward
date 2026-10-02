@@ -62,9 +62,6 @@ jobs:
         run: |
           cargo install cosmwasm-check --version 2.2.2 --locked
 
-      - name: Test A9 release and deployment tooling
-        run: python -m unittest discover -s scripts/tests -p 'test_*.py' -v
-
       - name: Build reproducible release Wasm and validate manifest
         run: |
           python scripts/a9_release.py build --output artifacts/ci-release
@@ -94,7 +91,7 @@ jobs:
           cargo deny check
           cargo deny --manifest-path tools/proto-gen/Cargo.toml --config deny.toml --locked check
 
-  python-offline-runner:
+  python-release-tooling:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -107,23 +104,3 @@ jobs:
 
       - name: Run A9 release and deployment tooling tests
         run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py' -v
-
-      - name: Run A8 suite and E2E offline runner tests
-        run: python3 -B -m unittest discover -s ops/a8/tests -p 'test_*.py' -v
-
-      - name: Verify local Git source acquisition
-        run: python3 -B -m unittest discover -s ops/a8/integration_tests -p 'test_*.py' -v
-
-  windows-host-wrapper:
-    runs-on: windows-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c # v5.0.0
-        with:
-          python-version: "3.11"
-
-      - name: Check Windows host-wrapper behavior
-        run: python -B -m unittest discover -s ops/a8/tests -p test_e2e_host_wrappers.py -v

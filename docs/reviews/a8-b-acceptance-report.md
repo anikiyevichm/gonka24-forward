@@ -6,7 +6,7 @@ This report preserves the 2026-09-10 review of earlier source revisions. Its
 acceptance decision applies only to the recorded commits, scenarios and receipts;
 it is **not** a current acceptance verdict for PR #27's immutable-source runner
 or its head commit. That runner requires its own full run package and review as
-described in [`ops/e2e/RUNBOOK-immutable-sources.md`](../../ops/e2e/RUNBOOK-immutable-sources.md).
+described in [`ops/e2e/RUNBOOK-immutable-sources.md`](https://github.com/gonka24/forward-e2e/blob/main/ops/e2e/RUNBOOK-immutable-sources.md).
 
 The agreed scope of verification is complete; evidence is accepted. No
 additional live runs are required to close those historical MRs. Archived row-by-row matrix:
@@ -332,7 +332,7 @@ Historical reproduction command from the former overlay-era workflow follows.
 It is retained to explain the recorded evidence, **not** as an executable
 procedure for this PR: `gonka-overlay/` was removed and live execution now uses
 the immutable-source Docker runner in
-[`ops/e2e/README.md`](../../ops/e2e/README.md).
+[`ops/e2e/README.md`](https://github.com/gonka24/forward-e2e/blob/main/ops/e2e/README.md).
 
 From the historical Marketplace worktree with Docker Desktop and WSL available:
 

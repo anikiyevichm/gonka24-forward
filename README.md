@@ -7,6 +7,11 @@
 
 CosmWasm workspace for forward marketplace on the Gonka network.
 
+The independent live acceptance runner is maintained in
+[gonka24/forward-e2e](https://github.com/gonka24/forward-e2e).
+This repository retains the contracts, local Rust tests and release tooling;
+see the [E2E validation handoff](docs/e2e-validation.md).
+
 ## License
 
 Original Gonka24 code is source-available under [BUSL-1.1](LICENSE), with each
