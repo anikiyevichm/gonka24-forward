@@ -67,7 +67,7 @@ REQUIRED_BUILD_CHECKS = (
     "cosmwasm_check",
 )
 # These are the production dependencies documented as B1, B3, B4, B5,
-# and B6 in docs/deployment-tooling.md. B2 is
+# and B6 in docs/release-guide.md. B2 is
 # explicitly optional, so it is deliberately not a release gate.
 REQUIRED_PRODUCTION_RELEASE_CHECKS = (
     "B1_allowlisted_grpc",
